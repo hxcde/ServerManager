@@ -10,6 +10,7 @@ Verbindung eine isolierte FreeRDP-Sitzung in einem virtuellen X11-Bildschirm und
 - IP/Hostname, Port, Benutzername und Domäne
 - Administrative RDP-Sitzung über `/admin`
 - Zwischenablage und mehrere Bildschirmauflösungen
+- Browserlokaler Verlauf erfolgreicher Verbindungen ohne Passwortspeicherung
 - Parallele, voneinander getrennte Sitzungsprozesse
 - Automatische Zeitbegrenzung und Prozessbereinigung
 - Eigene Anmeldemaske mit zeitlich begrenzter, serverseitiger Sitzung

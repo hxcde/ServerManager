@@ -31,7 +31,7 @@
     button, input, select { font: inherit; }
     button { cursor: pointer; }
     main {
-      width: min(900px, calc(100% - 32px));
+      width: min(1180px, calc(100% - 32px));
       margin: 0 auto;
       padding: 28px 0;
     }
@@ -85,6 +85,12 @@
       border-radius: 14px;
       background: rgba(13, 25, 41, .94);
       box-shadow: 0 16px 45px rgba(0, 0, 0, .26);
+    }
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 270px;
+      gap: 14px;
+      align-items: stretch;
     }
     form { padding: 20px; }
     .grid { display: grid; grid-template-columns: 1fr 128px; gap: 14px; }
@@ -142,6 +148,81 @@
       font-size: .75rem;
       overflow-wrap: anywhere;
     }
+    .history {
+      display: flex;
+      min-height: 0;
+      flex-direction: column;
+      padding: 16px;
+    }
+    .history-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .history-header h2 {
+      margin: 0;
+      font-size: .88rem;
+      letter-spacing: -.01em;
+    }
+    .history-count {
+      display: grid;
+      min-width: 24px;
+      height: 24px;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--panel-soft);
+      font-size: .68rem;
+    }
+    .history-list {
+      display: grid;
+      gap: 7px;
+      max-height: 395px;
+      overflow-y: auto;
+      scrollbar-color: var(--line) transparent;
+    }
+    .history-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 30px;
+      gap: 5px;
+    }
+    .history-load,
+    .history-delete {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--text);
+      background: var(--panel-soft);
+    }
+    .history-load {
+      min-width: 0;
+      padding: 9px 10px;
+      text-align: left;
+    }
+    .history-load:hover,
+    .history-delete:hover { border-color: #416894; }
+    .history-load strong,
+    .history-load small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .history-load strong { font-size: .76rem; }
+    .history-load small { margin-top: 2px; color: var(--muted); font-size: .66rem; }
+    .history-delete {
+      display: grid;
+      min-height: 100%;
+      place-items: center;
+      padding: 0;
+      color: var(--muted);
+      font-size: 1rem;
+    }
+    .history-delete:hover { color: var(--danger); }
+    .history-empty {
+      margin: auto 0;
+      padding: 28px 12px;
+      color: var(--muted);
+      font-size: .72rem;
+      text-align: center;
+    }
     .viewer { display: none; height: 100vh; background: #03070c; overflow: hidden; }
     .viewer.active { display: grid; grid-template-rows: 44px minmax(0, 1fr); }
     .toolbar {
@@ -175,6 +256,10 @@
       background: #ffbf69;
     }
     .status-dot.connected { background: var(--accent); }
+    @media (max-width: 900px) {
+      .workspace { grid-template-columns: 1fr; }
+      .history-list { max-height: 220px; }
+    }
     @media (max-width: 760px) {
       main { padding: 20px 0; }
       .page-header { display: block; margin-bottom: 14px; }
@@ -200,6 +285,7 @@
       </div>
     </header>
 
+    <div class="workspace">
     <form class="card" id="connectionForm" novalidate>
       <div class="grid">
         <div class="field">
@@ -257,6 +343,14 @@
       <div class="message" id="message" role="alert" aria-live="polite"></div>
       <button class="primary" id="connectButton" type="submit">Browser-Sitzung starten</button>
     </form>
+    <aside class="card history" aria-labelledby="historyTitle">
+      <div class="history-header">
+        <h2 id="historyTitle">Letzte Sitzungen</h2>
+        <span class="history-count" id="historyCount">0</span>
+      </div>
+      <div class="history-list" id="historyList"></div>
+    </aside>
+    </div>
   </main>
 
   <section class="viewer" id="viewer">
@@ -281,8 +375,13 @@
     const status = document.querySelector("#status");
     const statusDot = document.querySelector("#statusDot");
     const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+    const historyList = document.querySelector("#historyList");
+    const historyCount = document.querySelector("#historyCount");
+    const historyKey = "servermanager.connectionHistory.v1";
+    const maxHistoryEntries = 8;
     let rfb = null;
     let sessionId = null;
+    let connectionHistory = loadHistory();
 
     function setMessage(text) {
       message.textContent = text;
@@ -299,6 +398,138 @@
             ? "Der Server hat eine ungültige Antwort geliefert."
             : `Serverfehler ${response.status}: ${text.trim().slice(0, 240)}`
         };
+      }
+    }
+
+    function loadHistory() {
+      try {
+        const stored = JSON.parse(localStorage.getItem(historyKey) || "[]");
+        if (!Array.isArray(stored)) return [];
+        return stored
+          .filter(entry =>
+            entry &&
+            typeof entry.host === "string" &&
+            Number.isInteger(entry.port) &&
+            typeof entry.username === "string"
+          )
+          .map(entry => ({
+            id: typeof entry.id === "string" ? entry.id : `${Date.now()}-${Math.random()}`,
+            host: entry.host,
+            port: entry.port,
+            username: entry.username,
+            domain: typeof entry.domain === "string" ? entry.domain : "",
+            resolution: typeof entry.resolution === "string" ? entry.resolution : "1600x900",
+            admin: Boolean(entry.admin),
+            clipboard: entry.clipboard !== false,
+            ignoreCertificate: Boolean(entry.ignoreCertificate),
+            lastUsed: Number(entry.lastUsed) || 0
+          }))
+          .slice(0, maxHistoryEntries);
+      } catch {
+        return [];
+      }
+    }
+
+    function persistHistory() {
+      try {
+        localStorage.setItem(historyKey, JSON.stringify(connectionHistory));
+      } catch {
+        setMessage("Der Browser konnte den Sitzungsverlauf nicht speichern.");
+      }
+    }
+
+    function historyIdentity(entry) {
+      return [
+        entry.host.toLowerCase(),
+        entry.port,
+        entry.username.toLowerCase(),
+        entry.domain.toLowerCase()
+      ].join("|");
+    }
+
+    function rememberConnection(payload) {
+      const entry = {
+        id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+        host: payload.host,
+        port: payload.port,
+        username: payload.username,
+        domain: payload.domain,
+        resolution: payload.resolution,
+        admin: payload.admin,
+        clipboard: payload.clipboard,
+        ignoreCertificate: payload.ignoreCertificate,
+        lastUsed: Date.now()
+      };
+      const identity = historyIdentity(entry);
+      connectionHistory = [
+        entry,
+        ...connectionHistory.filter(item => historyIdentity(item) !== identity)
+      ].slice(0, maxHistoryEntries);
+      persistHistory();
+      renderHistory();
+    }
+
+    function fillFromHistory(entry) {
+      document.querySelector("#host").value = entry.host;
+      document.querySelector("#port").value = entry.port;
+      document.querySelector("#username").value = entry.username;
+      document.querySelector("#domain").value = entry.domain;
+      document.querySelector("#resolution").value = entry.resolution || "1600x900";
+      document.querySelector("#admin").checked = Boolean(entry.admin);
+      document.querySelector("#clipboard").checked = entry.clipboard !== false;
+      document.querySelector("#ignoreCertificate").checked = Boolean(entry.ignoreCertificate);
+      const password = document.querySelector("#password");
+      password.value = "";
+      password.focus();
+      setMessage("");
+    }
+
+    function deleteHistoryEntry(id) {
+      connectionHistory = connectionHistory.filter(entry => entry.id !== id);
+      persistHistory();
+      renderHistory();
+    }
+
+    function renderHistory() {
+      historyList.replaceChildren();
+      historyCount.textContent = connectionHistory.length;
+
+      if (!connectionHistory.length) {
+        const empty = document.createElement("p");
+        empty.className = "history-empty";
+        empty.textContent = "Noch keine Verbindungen gespeichert.";
+        historyList.append(empty);
+        return;
+      }
+
+      for (const entry of connectionHistory) {
+        const item = document.createElement("div");
+        item.className = "history-item";
+
+        const load = document.createElement("button");
+        load.type = "button";
+        load.className = "history-load";
+        load.title = `${entry.host}:${entry.port}`;
+
+        const target = document.createElement("strong");
+        target.textContent = entry.host;
+        const account = document.createElement("small");
+        account.textContent =
+          `${entry.domain ? `${entry.domain}\\` : ""}${entry.username} · ${entry.port}` +
+          (entry.admin ? " · Admin" : "");
+        load.append(target, account);
+        load.addEventListener("click", () => fillFromHistory(entry));
+
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "history-delete";
+        remove.textContent = "×";
+        remove.title = "Eintrag löschen";
+        remove.setAttribute("aria-label", `${entry.host} aus Verlauf löschen`);
+        remove.addEventListener("click", () => deleteHistoryEntry(entry.id));
+
+        item.append(load, remove);
+        historyList.append(item);
       }
     }
 
@@ -353,6 +584,7 @@
         const result = await readResponse(response);
         if (!response.ok) throw new Error(result.error || "Die Sitzung konnte nicht gestartet werden.");
 
+        rememberConnection(payload);
         document.querySelector("#password").value = "";
         sessionId = result.id;
         launcher.hidden = true;
@@ -407,6 +639,7 @@
         }).catch(() => {});
       }
     });
+    renderHistory();
   </script>
 </body>
 </html>
