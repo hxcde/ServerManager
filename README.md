@@ -28,7 +28,39 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-Der Container lauscht ausschließlich auf `127.0.0.1:8080`. Für den Zugriff aus dem Netzwerk muss Nginx mit TLS vorgeschaltet werden. Eine Vorlage liegt unter `nginx/servermanager.conf`.
+Danach ist die Oberfläche im lokalen Netzwerk unter folgender Adresse erreichbar:
+
+```text
+http://IP-DES-LINUX-SERVERS:8080
+```
+
+Der Browser fragt nach `APP_USERNAME` und `APP_PASSWORD` aus der `.env`-Datei. `BIND_ADDRESS=0.0.0.0` erlaubt den Zugriff aus dem LAN. Sobald Nginx mit HTTPS eingerichtet ist, sollte `BIND_ADDRESS` wieder auf `127.0.0.1` gesetzt werden. Eine Nginx-Vorlage liegt unter `nginx/servermanager.conf`.
+
+## Kein Zugriff vom PC
+
+Auf dem Linux-Server prüfen:
+
+```bash
+docker compose ps
+docker compose logs --tail=100
+curl http://127.0.0.1:8080/healthz
+ss -lntp | grep 8080
+```
+
+Falls UFW aktiv ist, Port 8080 nur für das eigene Management-Netz freigeben:
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 8080 proto tcp
+```
+
+Danach die geänderte Bind-Adresse übernehmen:
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+Die Server-IP lässt sich beispielsweise mit `hostname -I` anzeigen.
 
 ## Voraussetzungen
 
@@ -41,7 +73,7 @@ Der Container lauscht ausschließlich auf `127.0.0.1:8080`. Für den Zugriff aus
 
 Die Anwendung ist ein administrativer MVP und sollte nur in einem geschützten Management-Netz betrieben werden.
 
-- Niemals ohne HTTPS veröffentlichen.
+- Port 8080 ohne HTTPS nur vorübergehend in einem vertrauenswürdigen LAN verwenden.
 - Zugriff zusätzlich über VPN, Zero-Trust-Proxy oder IP-Allowlist begrenzen.
 - Ein eigenes starkes Gateway-Passwort setzen.
 - `Zertifikat ignorieren` nur für bekannte interne Systeme aktivieren.
