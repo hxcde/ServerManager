@@ -179,43 +179,55 @@
     }
     .history-list {
       display: grid;
-      gap: 7px;
+      gap: 9px;
       max-height: 395px;
       overflow-y: auto;
       scrollbar-color: var(--line) transparent;
     }
     .history-item {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 30px;
-      gap: 5px;
+      grid-template-columns: minmax(0, 1fr) 38px;
+      gap: 7px;
     }
     .history-load,
     .history-delete {
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 10px;
       color: var(--text);
-      background: var(--panel-soft);
+      background: #0e1d30;
+      transition: border-color 140ms, background-color 140ms, color 140ms, transform 140ms;
     }
     .history-load {
       min-width: 0;
-      padding: 9px 10px;
+      padding: 11px 12px;
       text-align: left;
     }
-    .history-load:hover,
-    .history-delete:hover { border-color: #416894; }
+    .history-load:hover {
+      border-color: #416894;
+      background: #12243a;
+      transform: translateY(-1px);
+    }
     .history-load strong,
     .history-load small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .history-load strong { font-size: .76rem; }
-    .history-load small { margin-top: 2px; color: var(--muted); font-size: .66rem; }
+    .history-load strong { font-size: .8rem; letter-spacing: -.01em; }
+    .history-load small { margin-top: 4px; color: #87a5c9; font-size: .67rem; }
     .history-delete {
       display: grid;
       min-height: 100%;
       place-items: center;
       padding: 0;
-      color: var(--muted);
-      font-size: 1rem;
+      color: #ff6f7d;
+      background: rgba(255, 111, 125, .07);
     }
-    .history-delete:hover { color: var(--danger); }
+    .history-delete svg { width: 15px; height: 15px; }
+    .history-delete:hover {
+      border-color: rgba(255, 111, 125, .7);
+      color: #ff9aa4;
+      background: rgba(255, 111, 125, .14);
+      transform: translateY(-1px);
+    }
+    .history-delete:active,
+    .history-load:active { transform: translateY(0); }
     .history-empty {
       margin: auto 0;
       padding: 28px 12px;
@@ -523,9 +535,15 @@
         const remove = document.createElement("button");
         remove.type = "button";
         remove.className = "history-delete";
-        remove.textContent = "×";
         remove.title = "Eintrag löschen";
         remove.setAttribute("aria-label", `${entry.host} aus Verlauf löschen`);
+        remove.innerHTML = `
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5"
+              stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+              stroke-linejoin="round"/>
+          </svg>
+        `;
         remove.addEventListener("click", () => deleteHistoryEntry(entry.id));
 
         item.append(load, remove);
