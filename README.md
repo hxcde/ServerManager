@@ -1,33 +1,67 @@
 # ServerManager
 
-Eine lokale Weboberfläche zum Erzeugen direkter RDP-Verbindungen für autorisierte Windows-Server. Unterstützt IP-Adresse oder Hostname, Port, Benutzername, Domäne, Auflösung, Zwischenablage und eine administrative Sitzung.
+ServerManager ist ein eigenständiger Browser-RDP-Gateway-MVP für einen Linux-Server. Er startet pro Verbindung eine isolierte FreeRDP-Sitzung in einem virtuellen X11-Bildschirm und überträgt diesen über x11vnc, WebSocket und noVNC in den Browser.
 
-## Nginx
+## Funktionen
 
-```nginx
-server {
-    listen 80;
-    server_name rdp.example.internal;
+- RDP direkt im Browser, ohne `.rdp`-Download
+- IP/Hostname, Port, Benutzername und Domäne
+- Administrative RDP-Sitzung über `/admin`
+- Zwischenablage und mehrere Bildschirmauflösungen
+- Parallele, voneinander getrennte Sitzungsprozesse
+- Automatische Zeitbegrenzung und Prozessbereinigung
+- HTTP Basic Auth vor Anwendung und WebSocket
+- Keine persistente Speicherung von RDP-Passwörtern
 
-    root /var/www/servermanager;
-    index index.html;
+## Installation auf dem Linux-Server
 
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-}
+```bash
+git clone https://github.com/hxcde/ServerManager.git
+cd ServerManager
+cp .env.example .env
 ```
 
-Die Dateien können beispielsweise nach `/var/www/servermanager` ausgecheckt werden.
+In `.env` unbedingt ein langes, zufälliges `APP_PASSWORD` setzen. Danach:
 
-## Wichtiger technischer Hinweis
+```bash
+docker compose up -d --build
+docker compose logs -f
+```
 
-Diese statische Version erzeugt eine `.rdp`-Datei, die anschließend vom Windows-RDP-Client geöffnet wird. Ein Browser und Nginx allein können keine native RDP-Sitzung darstellen oder `mstsc.exe` auf einem entfernten Client starten.
+Der Container lauscht ausschließlich auf `127.0.0.1:8080`. Für den Zugriff aus dem Netzwerk muss Nginx mit TLS vorgeschaltet werden. Eine Vorlage liegt unter `nginx/servermanager.conf`.
 
-Für eine vollständige RDP-Sitzung direkt im Browser wird zusätzlich ein Gateway wie [Apache Guacamole](https://guacamole.apache.org/) benötigt. Zugangsdaten sollten dann ausschließlich serverseitig, verschlüsselt und mit einer vorgeschalteten Authentifizierung verarbeitet werden.
+## Voraussetzungen
+
+- Linux-Server mit Docker Engine und Docker Compose
+- Netzwerkzugriff des Containers auf die RDP-Zielserver
+- Nginx und ein gültiges TLS-Zertifikat
+- Firewall-Regeln, die den Zugriff auf die Weboberfläche beschränken
 
 ## Sicherheit
 
-- Nur für Systeme verwenden, für die eine ausdrückliche Administrationsberechtigung besteht.
-- Passwörter werden von dieser Anwendung nicht verarbeitet oder gespeichert.
-- Die Admin-Option fordert eine administrative RDP-Sitzung an.
+Die Anwendung ist ein administrativer MVP und sollte nur in einem geschützten Management-Netz betrieben werden.
+
+- Niemals ohne HTTPS veröffentlichen.
+- Zugriff zusätzlich über VPN, Zero-Trust-Proxy oder IP-Allowlist begrenzen.
+- Ein eigenes starkes Gateway-Passwort setzen.
+- `Zertifikat ignorieren` nur für bekannte interne Systeme aktivieren.
+- Container nicht mit Host-Netzwerk oder privilegiert starten.
+- RDP-Ziele per Firewall auf den Gateway-Server beschränken.
+
+Das RDP-Passwort wird im Request empfangen, direkt über `stdin` an FreeRDP übergeben, danach aus dem Session-Payload entfernt und weder protokolliert noch auf einem Datenträger gespeichert.
+
+## Architektur
+
+```text
+Browser -> Nginx/TLS -> aiohttp WebSocket-Proxy -> x11vnc
+                                                -> Xvfb/Openbox
+                                                -> FreeRDP -> Windows Server
+```
+
+## Grenzen des MVP
+
+- Kein Benutzerverzeichnis und keine gespeicherten Serverprofile
+- Keine Sitzungsaufzeichnung oder zentrale Audit-Datenbank
+- Feste Auflösung während einer laufenden Sitzung
+- Zwischenablage hängt von FreeRDP, x11vnc und Browser-Unterstützung ab
+- Noch kein Kubernetes- oder Multi-Node-Scheduler
