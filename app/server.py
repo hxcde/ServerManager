@@ -3,6 +3,7 @@ import contextlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -24,6 +25,7 @@ HOST_RE = re.compile(
 USERNAME_RE = re.compile(r"^[^\r\n\x00]{1,256}$")
 RESOLUTIONS = {(1280, 720), (1366, 768), (1600, 900), (1920, 1080)}
 AUTH_COOKIE = "servermanager_session"
+LOGGER = logging.getLogger("servermanager")
 
 
 @dataclass
@@ -395,13 +397,45 @@ async def drain_log(stream: asyncio.StreamReader | None, name: str) -> None:
 
 
 def request_origin(request: web.Request) -> str:
-    forwarded_proto = request.headers.get("X-Forwarded-Proto")
+    public_url = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+    if public_url:
+        return public_url
+    trust_proxy = os.getenv("TRUST_PROXY_HEADERS", "false").lower() in {"1", "true", "yes"}
+    if trust_proxy:
+        forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+        forwarded_host = request.headers.get("X-Forwarded-Host", "").split(",")[0].strip()
+    else:
+        forwarded_proto = ""
+        forwarded_host = ""
     scheme = forwarded_proto or request.scheme
-    return f"{scheme}://{request.host}"
+    host = forwarded_host or request.host
+    return f"{scheme}://{host}"
 
 
 def secure_cookie(request: web.Request) -> bool:
-    return request.headers.get("X-Forwarded-Proto", request.scheme) == "https"
+    return request_origin(request).startswith("https://")
+
+
+@web.middleware
+async def api_error_middleware(request: web.Request, handler):
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except (RuntimeError, FileNotFoundError, OSError) as error:
+        LOGGER.exception("Gateway operation failed")
+        if request.path.startswith("/api/"):
+            message = str(error).strip() or "Die Gateway-Sitzung konnte nicht gestartet werden."
+            return web.json_response({"error": message}, status=500)
+        raise
+    except Exception:
+        LOGGER.exception("Unexpected request failure")
+        if request.path.startswith("/api/"):
+            return web.json_response(
+                {"error": "Interner Serverfehler. Bitte die Container-Logs prüfen."},
+                status=500,
+            )
+        raise
 
 
 @web.middleware
@@ -582,7 +616,7 @@ def create_app() -> web.Application:
         raise RuntimeError("APP_USERNAME und APP_PASSWORD müssen gesetzt sein.")
 
     app = web.Application(
-        middlewares=[security_middleware],
+        middlewares=[api_error_middleware, security_middleware],
         client_max_size=16 * 1024,
     )
     app["sessions"] = SessionManager()

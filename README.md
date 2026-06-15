@@ -44,6 +44,17 @@ Stunden gehalten und kann mit `AUTH_SESSION_SECONDS` angepasst werden.
 eingerichtet ist, sollte `BIND_ADDRESS` wieder auf `127.0.0.1` gesetzt werden.
 Eine Nginx-Vorlage liegt unter `nginx/servermanager.conf`.
 
+Bei Nginx Proxy Manager in `.env` zusätzlich die öffentliche Adresse setzen:
+
+```env
+PUBLIC_URL=https://rdp.example.internal
+```
+
+Im Proxy Host muss **Websockets Support** aktiviert sein. Als Forward Scheme
+`http`, als Forward Host die IP des ServerManager-Hosts und als Forward Port
+`8080` verwenden. Bei aktuellen NPM-Versionen kann es bei WebSocket-Problemen
+helfen, HTTP/2 für diesen Proxy Host zu deaktivieren.
+
 ## Kein Zugriff vom PC
 
 Auf dem Linux-Server prüfen:

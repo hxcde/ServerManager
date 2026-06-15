@@ -282,6 +282,20 @@
       message.textContent = text;
     }
 
+    async function readResponse(response) {
+      const text = await response.text();
+      if (!text) return {};
+      try {
+        return JSON.parse(text);
+      } catch {
+        return {
+          error: response.ok
+            ? "Der Server hat eine ungültige Antwort geliefert."
+            : `Serverfehler ${response.status}: ${text.trim().slice(0, 240)}`
+        };
+      }
+    }
+
     async function closeSession() {
       if (rfb) {
         try { rfb.disconnect(); } catch {}
@@ -330,7 +344,7 @@
           },
           body: JSON.stringify(payload)
         });
-        const result = await response.json();
+        const result = await readResponse(response);
         if (!response.ok) throw new Error(result.error || "Die Sitzung konnte nicht gestartet werden.");
 
         document.querySelector("#password").value = "";
