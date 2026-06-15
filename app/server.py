@@ -1,32 +1,60 @@
 import asyncio
+import base64
 import contextlib
 import hmac
-import ipaddress
+import io
 import json
 import logging
 import os
 import re
 import secrets
-import signal
-import socket
+import sqlite3
 import time
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
+import pyotp
+import qrcode
 from aiohttp import WSMsgType, web
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerifyMismatchError
+from qrcode.image.svg import SvgPathImage
+from webauthn import (
+    base64url_to_bytes,
+    generate_authentication_options,
+    generate_registration_options,
+    options_to_json,
+    verify_authentication_response,
+    verify_registration_response,
+)
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria,
+    PublicKeyCredentialDescriptor,
+    ResidentKeyRequirement,
+    UserVerificationRequirement,
+)
+from webauthn.helpers.exceptions import (
+    InvalidAuthenticationResponse,
+    InvalidRegistrationResponse,
+)
+
+from rdp import SessionManager, validate_connection
+from storage import Database
 
 
 STATIC_DIR = Path(__file__).parent / "static"
 NOVNC_DIR = Path("/usr/share/novnc")
-HOST_RE = re.compile(
-    r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*"
-    r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
-)
-USERNAME_RE = re.compile(r"^[^\r\n\x00]{1,256}$")
-ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-RESOLUTIONS = {(1280, 720), (1366, 768), (1600, 900), (1920, 1080)}
 AUTH_COOKIE = "servermanager_session"
+APP_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+DOMAIN_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+PUBLIC_PATHS = {
+    "/healthz",
+    "/login",
+    "/api/login/password",
+    "/api/login/passkey/options",
+    "/api/login/passkey/verify",
+}
 LOGGER = logging.getLogger("servermanager")
 
 
@@ -34,7 +62,19 @@ LOGGER = logging.getLogger("servermanager")
 class AuthSession:
     session_id: str
     csrf_token: str
+    user_id: int
+    username: str
+    display_name: str
+    is_admin: bool
     expires_at: float
+
+
+@dataclass
+class WebAuthnCeremony:
+    user_id: int
+    challenge: bytes
+    expires_at: float
+    name: str = ""
 
 
 class AuthManager:
@@ -45,10 +85,14 @@ class AuthManager:
         self.login_window_seconds = 300
         self.max_login_attempts = 5
 
-    def create(self) -> AuthSession:
+    def create(self, user: sqlite3.Row) -> AuthSession:
         session = AuthSession(
             session_id=secrets.token_urlsafe(32),
             csrf_token=secrets.token_urlsafe(32),
+            user_id=user["id"],
+            username=user["username"],
+            display_name=user["display_name"],
+            is_admin=bool(user["is_admin"]),
             expires_at=time.time() + self.session_seconds,
         )
         self.sessions[session.session_id] = session
@@ -69,6 +113,14 @@ class AuthManager:
         if session_id:
             self.sessions.pop(session_id, None)
 
+    def delete_user_sessions(self, user_id: int) -> list[str]:
+        deleted = []
+        for session_id, session in list(self.sessions.items()):
+            if session.user_id == user_id:
+                self.sessions.pop(session_id, None)
+                deleted.append(session_id)
+        return deleted
+
     def login_allowed(self, client_ip: str) -> bool:
         cutoff = time.time() - self.login_window_seconds
         attempts = [stamp for stamp in self.failed_logins.get(client_ip, []) if stamp > cutoff]
@@ -82,386 +134,113 @@ class AuthManager:
         self.failed_logins.pop(client_ip, None)
 
 
-@dataclass
-class Session:
-    session_id: str
-    owner_id: str
-    display: int
-    vnc_port: int
-    created_at: float
-    processes: list[asyncio.subprocess.Process] = field(default_factory=list)
-    log_tasks: list[asyncio.Task] = field(default_factory=list)
-    log_lines: deque[str] = field(default_factory=lambda: deque(maxlen=100))
-    websocket_count: int = 0
-
-
-class SessionManager:
-    def __init__(self) -> None:
-        self.sessions: dict[str, Session] = {}
-        self.lock = asyncio.Lock()
-        self.max_sessions = int(os.getenv("MAX_SESSIONS", "10"))
-        self.max_session_seconds = int(os.getenv("MAX_SESSION_SECONDS", "28800"))
-        self.display_min = 100
-        self.display_max = self.display_min + self.max_sessions - 1
-        self.port_min = 5900
-        self.cleanup_task: asyncio.Task | None = None
-
-    async def start(self) -> None:
-        self.cleanup_task = asyncio.create_task(self._cleanup_loop())
-
-    async def close(self) -> None:
-        if self.cleanup_task:
-            self.cleanup_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.cleanup_task
-        await asyncio.gather(
-            *(self.stop(session_id) for session_id in list(self.sessions)),
-            return_exceptions=True,
-        )
-
-    async def create(self, payload: dict, owner_id: str) -> Session:
-        connection = validate_connection(payload)
-
-        async with self.lock:
-            if len(self.sessions) >= self.max_sessions:
-                raise web.HTTPServiceUnavailable(
-                    text=json.dumps({"error": "Die maximale Anzahl paralleler Sitzungen ist erreicht."}),
-                    content_type="application/json",
-                )
-
-            used_displays = {session.display for session in self.sessions.values()}
-            display = next(
-                (number for number in range(self.display_min, self.display_max + 1)
-                 if number not in used_displays),
-                None,
-            )
-            if display is None:
-                raise web.HTTPServiceUnavailable(
-                    text=json.dumps({"error": "Kein virtueller Bildschirm ist verfügbar."}),
-                    content_type="application/json",
-                )
-
-            vnc_port = find_free_port(self.port_min, self.port_min + self.max_sessions + 20)
-            session = Session(
-                session_id=secrets.token_urlsafe(24),
-                owner_id=owner_id,
-                display=display,
-                vnc_port=vnc_port,
-                created_at=time.monotonic(),
-            )
-            self.sessions[session.session_id] = session
-
-        try:
-            await self._launch(session, connection)
-            return session
-        except Exception:
-            await self.stop(session.session_id)
-            raise
-
-    async def stop(self, session_id: str) -> None:
-        async with self.lock:
-            session = self.sessions.pop(session_id, None)
-        if not session:
-            return
-
-        for process in reversed(session.processes):
-            if process.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    process.send_signal(signal.SIGTERM)
-
-        for process in reversed(session.processes):
-            if process.returncode is None:
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=3)
-                except asyncio.TimeoutError:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                    await process.wait()
-
-        for task in session.log_tasks:
-            task.cancel()
-        await asyncio.gather(*session.log_tasks, return_exceptions=True)
-
-    async def stop_owned(self, owner_id: str) -> None:
-        owned = [
-            session_id
-            for session_id, session in self.sessions.items()
-            if session.owner_id == owner_id
-        ]
-        await asyncio.gather(*(self.stop(session_id) for session_id in owned))
-
-    async def _launch(self, session: Session, connection: dict) -> None:
-        display_env = {**os.environ, "DISPLAY": f":{session.display}"}
-        for variable in (
-            "ALL_PROXY",
-            "HTTPS_PROXY",
-            "HTTP_PROXY",
-            "NO_PROXY",
-            "all_proxy",
-            "https_proxy",
-            "http_proxy",
-            "no_proxy",
-        ):
-            display_env.pop(variable, None)
-        width, height = connection["resolution"]
-
-        xvfb = await asyncio.create_subprocess_exec(
-            "Xvfb",
-            f":{session.display}",
-            "-screen",
-            "0",
-            f"{width}x{height}x24",
-            "-nolisten",
-            "tcp",
-            "-ac",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        session.processes.append(xvfb)
-        session.log_tasks.append(
-            asyncio.create_task(drain_log(xvfb.stderr, "Xvfb", session.log_lines))
-        )
-        await asyncio.sleep(0.35)
-        ensure_running(xvfb, "Der virtuelle Bildschirm konnte nicht gestartet werden.")
-
-        openbox = await asyncio.create_subprocess_exec(
-            "openbox",
-            "--sm-disable",
-            env=display_env,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        session.processes.append(openbox)
-        session.log_tasks.append(
-            asyncio.create_task(drain_log(openbox.stderr, "openbox", session.log_lines))
-        )
-
-        x11vnc = await asyncio.create_subprocess_exec(
-            "x11vnc",
-            "-display",
-            f":{session.display}",
-            "-rfbport",
-            str(session.vnc_port),
-            "-localhost",
-            "-forever",
-            "-shared",
-            "-nopw",
-            "-quiet",
-            "-noxdamage",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        session.processes.append(x11vnc)
-        session.log_tasks.append(
-            asyncio.create_task(drain_log(x11vnc.stderr, "x11vnc", session.log_lines))
-        )
-        await wait_for_port("127.0.0.1", session.vnc_port, timeout=5)
-
-        args = [
-            "xfreerdp3",
-            f"/v:{connection['host']}:{connection['port']}",
-            f"/u:{connection['username']}",
-            f"/size:{width}x{height}",
-            "/bpp:24",
-            "/network:auto",
-            "+auto-reconnect",
-            "/auto-reconnect-max-retries:3",
-            "/from-stdin:force",
-            "/log-level:WARN",
-            "/timeout:15000",
-            "/f",
-            "-decorations",
-            "-grab-keyboard",
-        ]
-        if connection["domain"]:
-            args.append(f"/d:{connection['domain']}")
-        if connection["admin"]:
-            args.append("/admin")
-        if connection["clipboard"]:
-            args.append("+clipboard")
-        if connection["ignore_certificate"]:
-            args.append("/cert:ignore")
-
-        freerdp = await asyncio.create_subprocess_exec(
-            *args,
-            env=display_env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        session.processes.append(freerdp)
-        session.log_tasks.append(
-            asyncio.create_task(drain_log(freerdp.stderr, "FreeRDP", session.log_lines))
-        )
-        session.log_tasks.append(
-            asyncio.create_task(drain_log(freerdp.stdout, "FreeRDP", session.log_lines))
-        )
-        try:
-            freerdp.stdin.write((connection["password"] + "\n").encode("utf-8"))
-            await freerdp.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            freerdp.stdin.close()
-        connection["password"] = ""
-
-        try:
-            exit_code = await asyncio.wait_for(freerdp.wait(), timeout=2.5)
-        except asyncio.TimeoutError:
-            return
-
-        await asyncio.sleep(0.1)
-        details = [
-            line.removeprefix("FreeRDP: ")
-            for line in session.log_lines
-            if line.startswith("FreeRDP: ")
-        ]
-        detail = " | ".join(details[-6:])[-1200:]
-        message = f"FreeRDP wurde mit Exit-Code {exit_code} beendet."
-        if detail:
-            message += f" {detail}"
-        raise RuntimeError(message)
-
-    async def _cleanup_loop(self) -> None:
-        while True:
-            await asyncio.sleep(30)
-            now = time.monotonic()
-            expired = []
-            for session_id, session in list(self.sessions.items()):
-                freerdp_exited = bool(
-                    session.processes and session.processes[-1].returncode is not None
-                )
-                timed_out = now - session.created_at > self.max_session_seconds
-                if freerdp_exited or timed_out:
-                    expired.append(session_id)
-            await asyncio.gather(*(self.stop(session_id) for session_id in expired))
-
-
-def validate_connection(payload: dict) -> dict:
-    host = str(payload.get("host", "")).strip()
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        if not HOST_RE.fullmatch(host):
-            raise web.HTTPBadRequest(
-                text=json.dumps({"error": "Ungültige IP-Adresse oder ungültiger Hostname."}),
-                content_type="application/json",
-            )
-
-    try:
-        port = int(payload.get("port", 3389))
-    except (TypeError, ValueError):
-        port = 0
-    if not 1 <= port <= 65535:
-        raise web.HTTPBadRequest(
-            text=json.dumps({"error": "Der Port muss zwischen 1 und 65535 liegen."}),
-            content_type="application/json",
-        )
-
-    username = str(payload.get("username", "")).strip()
-    domain = str(payload.get("domain", "")).strip()
-    password = str(payload.get("password", ""))
-    if not USERNAME_RE.fullmatch(username):
-        raise web.HTTPBadRequest(
-            text=json.dumps({"error": "Ein gültiger Benutzername ist erforderlich."}),
-            content_type="application/json",
-        )
-    if domain and not USERNAME_RE.fullmatch(domain):
-        raise web.HTTPBadRequest(
-            text=json.dumps({"error": "Die Domäne enthält ungültige Zeichen."}),
-            content_type="application/json",
-        )
-    if not password or len(password) > 1024 or "\x00" in password:
-        raise web.HTTPBadRequest(
-            text=json.dumps({"error": "Ein gültiges Passwort ist erforderlich."}),
-            content_type="application/json",
-        )
-
-    resolution_text = str(payload.get("resolution", "1600x900"))
-    try:
-        resolution = tuple(int(part) for part in resolution_text.split("x", 1))
-    except ValueError:
-        resolution = ()
-    if resolution not in RESOLUTIONS:
-        raise web.HTTPBadRequest(
-            text=json.dumps({"error": "Ungültige Bildschirmauflösung."}),
-            content_type="application/json",
-        )
-
-    return {
-        "host": host,
-        "port": port,
-        "username": username,
-        "domain": domain,
-        "password": password,
-        "resolution": resolution,
-        "admin": bool(payload.get("admin", False)),
-        "clipboard": bool(payload.get("clipboard", True)),
-        "ignore_certificate": bool(payload.get("ignoreCertificate", False)),
-    }
-
-
-def find_free_port(start: int, end: int) -> int:
-    for port in range(start, end + 1):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
-            try:
-                candidate.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
-    raise RuntimeError("Kein lokaler VNC-Port ist verfügbar.")
-
-
-async def wait_for_port(host: str, port: int, timeout: float) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        try:
-            reader, writer = await asyncio.open_connection(host, port)
-            writer.close()
-            await writer.wait_closed()
-            return
-        except OSError:
-            await asyncio.sleep(0.1)
-    raise RuntimeError("Der lokale Bildschirm-Proxy ist nicht erreichbar.")
-
-
-def ensure_running(process: asyncio.subprocess.Process, message: str) -> None:
-    if process.returncode is not None:
-        raise RuntimeError(message)
-
-
-async def drain_log(
-    stream: asyncio.StreamReader | None,
-    name: str,
-    log_lines: deque[str],
-) -> None:
-    if not stream:
-        return
-    while line := await stream.readline():
-        text = ANSI_ESCAPE_RE.sub("", line.decode("utf-8", errors="replace")).rstrip()
-        if text:
-            log_lines.append(f"{name}: {text}")
-            print(f"[{name}] {text}", flush=True)
+def env_flag(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).lower() in {"1", "true", "yes"}
 
 
 def request_origin(request: web.Request) -> str:
     public_url = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
     if public_url:
         return public_url
-    trust_proxy = os.getenv("TRUST_PROXY_HEADERS", "false").lower() in {"1", "true", "yes"}
-    if trust_proxy:
+    if env_flag("TRUST_PROXY_HEADERS"):
         forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
         forwarded_host = request.headers.get("X-Forwarded-Host", "").split(",")[0].strip()
     else:
         forwarded_proto = ""
         forwarded_host = ""
-    scheme = forwarded_proto or request.scheme
-    host = forwarded_host or request.host
-    return f"{scheme}://{host}"
+    return f"{forwarded_proto or request.scheme}://{forwarded_host or request.host}"
+
+
+def client_ip(request: web.Request) -> str:
+    if env_flag("TRUST_PROXY_HEADERS"):
+        forwarded = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return request.remote or "unknown"
 
 
 def secure_cookie(request: web.Request) -> bool:
     return request_origin(request).startswith("https://")
+
+
+def webauthn_config(request: web.Request) -> tuple[str, str]:
+    origin = os.getenv("WEBAUTHN_ORIGIN", "").strip().rstrip("/") or request_origin(request)
+    rp_id = os.getenv("WEBAUTHN_RP_ID", "").strip() or (urlparse(origin).hostname or "")
+    if not rp_id:
+        raise RuntimeError("WEBAUTHN_RP_ID konnte nicht ermittelt werden.")
+    return origin, rp_id
+
+
+def json_error(message: str, status: int) -> web.Response:
+    return web.json_response({"error": message}, status=status)
+
+
+async def json_body(request: web.Request) -> dict:
+    try:
+        value = await request.json(loads=json.loads)
+    except (json.JSONDecodeError, TypeError):
+        raise web.HTTPBadRequest(
+            text=json.dumps({"error": "Ungültige Anfrage."}),
+            content_type="application/json",
+        )
+    if not isinstance(value, dict):
+        raise web.HTTPBadRequest(
+            text=json.dumps({"error": "Ungültige Anfrage."}),
+            content_type="application/json",
+        )
+    return value
+
+
+def validate_app_password(password: str) -> None:
+    if not 12 <= len(password) <= 256 or "\x00" in password:
+        raise web.HTTPBadRequest(
+            text=json.dumps({"error": "Das Passwort muss 12 bis 256 Zeichen lang sein."}),
+            content_type="application/json",
+        )
+
+
+def verify_password(hasher: PasswordHasher, password_hash: str, password: str) -> bool:
+    try:
+        return hasher.verify(password_hash, password)
+    except (VerifyMismatchError, InvalidHashError):
+        return False
+
+
+def set_auth_cookie(request: web.Request, response: web.StreamResponse, session: AuthSession) -> None:
+    response.set_cookie(
+        AUTH_COOKIE,
+        session.session_id,
+        max_age=request.app["auth"].session_seconds,
+        httponly=True,
+        secure=secure_cookie(request),
+        samesite="Strict",
+        path="/",
+    )
+
+
+def prune_ceremonies(ceremonies: dict[str, WebAuthnCeremony]) -> None:
+    now = time.time()
+    for flow_id, ceremony in list(ceremonies.items()):
+        if ceremony.expires_at <= now:
+            ceremonies.pop(flow_id, None)
+
+
+def require_admin(request: web.Request) -> None:
+    if not request["auth"].is_admin:
+        raise web.HTTPForbidden(
+            text=json.dumps({"error": "Administratorrechte erforderlich."}),
+            content_type="application/json",
+        )
+
+
+def render_page(request: web.Request, filename: str) -> web.Response:
+    html = (STATIC_DIR / filename).read_text(encoding="utf-8")
+    html = html.replace("__CSRF_TOKEN__", request["auth"].csrf_token)
+    return web.Response(
+        text=html,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @web.middleware
@@ -470,92 +249,181 @@ async def api_error_middleware(request: web.Request, handler):
         return await handler(request)
     except web.HTTPException:
         raise
+    except sqlite3.IntegrityError:
+        return json_error("Dieser Eintrag ist bereits vorhanden.", 409)
     except (RuntimeError, FileNotFoundError, OSError) as error:
         LOGGER.exception("Gateway operation failed")
         if request.path.startswith("/api/"):
-            message = str(error).strip() or "Die Gateway-Sitzung konnte nicht gestartet werden."
-            return web.json_response({"error": message}, status=500)
+            return json_error(str(error).strip() or "Die Aktion ist fehlgeschlagen.", 500)
         raise
     except Exception:
         LOGGER.exception("Unexpected request failure")
         if request.path.startswith("/api/"):
-            return web.json_response(
-                {"error": "Interner Serverfehler. Bitte die Container-Logs prüfen."},
-                status=500,
-            )
+            return json_error("Interner Serverfehler. Bitte die Container-Logs prüfen.", 500)
         raise
 
 
 @web.middleware
 async def security_middleware(request: web.Request, handler):
-    if request.path in {"/healthz", "/login"}:
+    is_public = request.path in PUBLIC_PATHS
+    if is_public:
         if request.method == "POST":
             origin = request.headers.get("Origin")
-            if origin and origin != request_origin(request):
-                raise web.HTTPForbidden(text="Ungültiger Anfrageursprung.")
+            if not origin or origin != request_origin(request):
+                return json_error("Ungültiger Anfrageursprung.", 403)
         return await handler(request)
 
     auth = request.app["auth"].get(request.cookies.get(AUTH_COOKIE))
-    if not auth:
+    user = request.app["db"].get_user(auth.user_id) if auth else None
+    if not auth or not user or not user["enabled"]:
+        if auth:
+            request.app["auth"].delete(auth.session_id)
         if request.method == "GET" and not request.path.startswith("/api/"):
             raise web.HTTPFound("/login")
-        raise web.HTTPUnauthorized(
-            text=json.dumps({"error": "Die Anmeldung ist abgelaufen."}),
-            content_type="application/json",
-        )
+        return json_error("Die Anmeldung ist abgelaufen.", 401)
+
+    auth.username = user["username"]
+    auth.display_name = user["display_name"]
+    auth.is_admin = bool(user["is_admin"])
     request["auth"] = auth
 
     is_websocket = request.path.endswith("/websocket")
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} or is_websocket:
         origin = request.headers.get("Origin")
         if not origin or origin != request_origin(request):
-            raise web.HTTPForbidden(
-                text=json.dumps({"error": "Ungültiger Anfrageursprung."}),
-                content_type="application/json",
-            )
+            return json_error("Ungültiger Anfrageursprung.", 403)
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        csrf_token = request.headers.get("X-CSRF-Token", "")
-        if not hmac.compare_digest(csrf_token, auth.csrf_token):
-            raise web.HTTPForbidden(
-                text=json.dumps({"error": "Ungültiges Sicherheitstoken."}),
-                content_type="application/json",
-            )
+        token = request.headers.get("X-CSRF-Token", "")
+        if not hmac.compare_digest(token, auth.csrf_token):
+            return json_error("Ungültiges Sicherheitstoken.", 403)
     return await handler(request)
 
 
 async def login_page(request: web.Request) -> web.StreamResponse:
-    if request.method == "GET":
-        if request.app["auth"].get(request.cookies.get(AUTH_COOKIE)):
-            raise web.HTTPFound("/")
-        return web.FileResponse(STATIC_DIR / "login.html")
-
-    client_ip = request.headers.get("X-Forwarded-For", request.remote or "unknown").split(",")[0].strip()
-    if not request.app["auth"].login_allowed(client_ip):
-        raise web.HTTPFound("/login?locked=1")
-
-    form = await request.post()
-    username = str(form.get("username", ""))
-    password = str(form.get("password", ""))
-    valid = hmac.compare_digest(username, os.environ["APP_USERNAME"]) and hmac.compare_digest(
-        password, os.environ["APP_PASSWORD"]
+    if request.app["auth"].get(request.cookies.get(AUTH_COOKIE)):
+        raise web.HTTPFound("/")
+    return web.FileResponse(
+        STATIC_DIR / "login.html",
+        headers={"Cache-Control": "no-store"},
     )
-    if not valid:
-        request.app["auth"].record_failure(client_ip)
-        raise web.HTTPFound("/login?error=1")
 
-    request.app["auth"].clear_failures(client_ip)
-    auth = request.app["auth"].create()
-    response = web.HTTPFound("/")
-    response.set_cookie(
-        AUTH_COOKIE,
-        auth.session_id,
-        max_age=request.app["auth"].session_seconds,
-        httponly=True,
-        secure=secure_cookie(request),
-        samesite="Strict",
-        path="/",
+
+async def password_login(request: web.Request) -> web.Response:
+    remote = client_ip(request)
+    if not request.app["auth"].login_allowed(remote):
+        return json_error("Zu viele Fehlversuche. Bitte in einigen Minuten erneut versuchen.", 429)
+
+    payload = await json_body(request)
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    totp_code = str(payload.get("totp", "")).replace(" ", "")
+    user = request.app["db"].get_user_by_username(username)
+
+    password_hash = user["password_hash"] if user else request.app["dummy_password_hash"]
+    valid = verify_password(request.app["password_hasher"], password_hash, password)
+    if not user or not user["enabled"] or not valid:
+        request.app["auth"].record_failure(remote)
+        return json_error("Benutzername oder Passwort ist nicht korrekt.", 401)
+
+    if user["totp_enabled"]:
+        if not totp_code:
+            return web.json_response({"totpRequired": True}, status=202)
+        if not pyotp.TOTP(user["totp_secret"]).verify(totp_code, valid_window=1):
+            request.app["auth"].record_failure(remote)
+            return json_error("Der TOTP-Code ist nicht korrekt.", 401)
+
+    if request.app["password_hasher"].check_needs_rehash(user["password_hash"]):
+        request.app["db"].update_password(user["id"], password)
+        user = request.app["db"].get_user(user["id"])
+
+    request.app["auth"].clear_failures(remote)
+    session = request.app["auth"].create(user)
+    response = web.json_response({"ok": True})
+    set_auth_cookie(request, response, session)
+    return response
+
+
+async def passkey_login_options(request: web.Request) -> web.Response:
+    remote = client_ip(request)
+    if not request.app["auth"].login_allowed(remote):
+        return json_error("Zu viele Fehlversuche. Bitte in einigen Minuten erneut versuchen.", 429)
+
+    payload = await json_body(request)
+    username = str(payload.get("username", "")).strip()
+    user = request.app["db"].get_user_by_username(username)
+    if not user or not user["enabled"]:
+        request.app["auth"].record_failure(remote)
+        return json_error("Für diesen Benutzer ist kein Passkey verfügbar.", 400)
+
+    descriptors = request.app["db"].passkey_descriptors(user["id"])
+    if not descriptors:
+        return json_error("Für diesen Benutzer ist kein Passkey verfügbar.", 400)
+
+    origin, rp_id = webauthn_config(request)
+    options = generate_authentication_options(
+        rp_id=rp_id,
+        allow_credentials=[
+            PublicKeyCredentialDescriptor(id=bytes(row["credential_id"]))
+            for row in descriptors
+        ],
+        user_verification=UserVerificationRequirement.REQUIRED,
     )
-    raise response
+    flow_id = secrets.token_urlsafe(24)
+    prune_ceremonies(request.app["login_ceremonies"])
+    request.app["login_ceremonies"][flow_id] = WebAuthnCeremony(
+        user_id=user["id"],
+        challenge=options.challenge,
+        expires_at=time.time() + 300,
+    )
+    return web.json_response(
+        {
+            "flowId": flow_id,
+            "publicKey": json.loads(options_to_json(options)),
+            "origin": origin,
+        }
+    )
+
+
+async def passkey_login_verify(request: web.Request) -> web.Response:
+    payload = await json_body(request)
+    flow_id = str(payload.get("flowId", ""))
+    credential = payload.get("credential")
+    ceremony = request.app["login_ceremonies"].pop(flow_id, None)
+    if not ceremony or ceremony.expires_at <= time.time() or not isinstance(credential, dict):
+        return json_error("Die Passkey-Anfrage ist abgelaufen.", 400)
+
+    user = request.app["db"].get_user(ceremony.user_id)
+    if not user or not user["enabled"]:
+        return json_error("Die Anmeldung ist nicht möglich.", 401)
+
+    try:
+        credential_id = base64url_to_bytes(str(credential.get("id", "")))
+    except ValueError:
+        return json_error("Ungültige Passkey-Antwort.", 400)
+    passkey = request.app["db"].get_passkey(user["id"], credential_id)
+    if not passkey:
+        return json_error("Der Passkey ist nicht registriert.", 401)
+
+    origin, rp_id = webauthn_config(request)
+    try:
+        verification = verify_authentication_response(
+            credential=credential,
+            expected_challenge=ceremony.challenge,
+            expected_origin=origin,
+            expected_rp_id=rp_id,
+            credential_public_key=bytes(passkey["public_key"]),
+            credential_current_sign_count=passkey["sign_count"],
+            require_user_verification=True,
+        )
+    except InvalidAuthenticationResponse:
+        request.app["auth"].record_failure(client_ip(request))
+        return json_error("Die Passkey-Anmeldung konnte nicht bestätigt werden.", 401)
+    request.app["db"].update_passkey_counter(passkey["id"], verification.new_sign_count)
+    request.app["auth"].clear_failures(client_ip(request))
+    session = request.app["auth"].create(user)
+    response = web.json_response({"ok": True})
+    set_auth_cookie(request, response, session)
+    return response
 
 
 async def logout(request: web.Request) -> web.Response:
@@ -567,24 +435,297 @@ async def logout(request: web.Request) -> web.Response:
 
 
 async def index(request: web.Request) -> web.Response:
-    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    html = html.replace("__CSRF_TOKEN__", request["auth"].csrf_token)
-    return web.Response(
-        text=html,
-        content_type="text/html",
-        headers={"Cache-Control": "no-store"},
+    return render_page(request, "index.html")
+
+
+async def account_page(request: web.Request) -> web.Response:
+    return render_page(request, "account.html")
+
+
+async def admin_page(request: web.Request) -> web.Response:
+    require_admin(request)
+    return render_page(request, "admin.html")
+
+
+async def me(request: web.Request) -> web.Response:
+    user = request.app["db"].public_user(request["auth"].user_id)
+    user["passkeys"] = request.app["db"].list_passkeys(request["auth"].user_id)
+    return web.json_response(user)
+
+
+async def change_password(request: web.Request) -> web.Response:
+    payload = await json_body(request)
+    current_password = str(payload.get("currentPassword", ""))
+    new_password = str(payload.get("newPassword", ""))
+    validate_app_password(new_password)
+    user = request.app["db"].get_user(request["auth"].user_id)
+    if not verify_password(request.app["password_hasher"], user["password_hash"], current_password):
+        return json_error("Das aktuelle Passwort ist nicht korrekt.", 400)
+    request.app["db"].update_password(user["id"], new_password)
+    return web.json_response({"ok": True})
+
+
+async def totp_setup(request: web.Request) -> web.Response:
+    user = request.app["db"].get_user(request["auth"].user_id)
+    if user["totp_enabled"]:
+        return json_error("TOTP ist bereits eingerichtet.", 400)
+    secret = pyotp.random_base32()
+    issuer = os.getenv("TOTP_ISSUER", "ServerManager")
+    uri = pyotp.TOTP(secret).provisioning_uri(
+        name=user["username"],
+        issuer_name=issuer,
+    )
+    qr = qrcode.make(uri, image_factory=SvgPathImage)
+    output = io.BytesIO()
+    qr.save(output)
+    qr_data = base64.b64encode(output.getvalue()).decode("ascii")
+    request.app["totp_pending"][request["auth"].session_id] = {
+        "secret": secret,
+        "expiresAt": time.time() + 600,
+    }
+    return web.json_response(
+        {
+            "secret": secret,
+            "qrCode": f"data:image/svg+xml;base64,{qr_data}",
+        }
     )
 
 
-async def create_session(request: web.Request) -> web.Response:
+async def totp_enable(request: web.Request) -> web.Response:
+    payload = await json_body(request)
+    code = str(payload.get("code", "")).replace(" ", "")
+    pending = request.app["totp_pending"].get(request["auth"].session_id)
+    if not pending or pending["expiresAt"] <= time.time():
+        request.app["totp_pending"].pop(request["auth"].session_id, None)
+        return json_error("Die TOTP-Einrichtung ist abgelaufen.", 400)
+    if not pyotp.TOTP(pending["secret"]).verify(code, valid_window=1):
+        return json_error("Der TOTP-Code ist nicht korrekt.", 400)
+    request.app["totp_pending"].pop(request["auth"].session_id, None)
+    request.app["db"].set_totp(request["auth"].user_id, pending["secret"], True)
+    return web.json_response({"ok": True})
+
+
+async def totp_disable(request: web.Request) -> web.Response:
+    payload = await json_body(request)
+    code = str(payload.get("code", "")).replace(" ", "")
+    user = request.app["db"].get_user(request["auth"].user_id)
+    if not user["totp_enabled"]:
+        return web.json_response({"ok": True})
+    if not pyotp.TOTP(user["totp_secret"]).verify(code, valid_window=1):
+        return json_error("Der TOTP-Code ist nicht korrekt.", 400)
+    request.app["db"].set_totp(user["id"], None, False)
+    return web.json_response({"ok": True})
+
+
+async def passkey_register_options(request: web.Request) -> web.Response:
+    payload = await json_body(request)
+    name = str(payload.get("name", "")).strip()
+    if not 1 <= len(name) <= 80:
+        return json_error("Bitte einen Namen für den Passkey angeben.", 400)
+
+    user = request.app["db"].get_user(request["auth"].user_id)
+    existing = request.app["db"].passkey_descriptors(user["id"])
+    origin, rp_id = webauthn_config(request)
+    options = generate_registration_options(
+        rp_id=rp_id,
+        rp_name=os.getenv("WEBAUTHN_RP_NAME", "ServerManager"),
+        user_id=user["id"].to_bytes(8, "big"),
+        user_name=user["username"],
+        user_display_name=user["display_name"],
+        exclude_credentials=[
+            PublicKeyCredentialDescriptor(id=bytes(row["credential_id"]))
+            for row in existing
+        ],
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            resident_key=ResidentKeyRequirement.PREFERRED,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        ),
+    )
+    flow_id = secrets.token_urlsafe(24)
+    prune_ceremonies(request.app["registration_ceremonies"])
+    request.app["registration_ceremonies"][flow_id] = WebAuthnCeremony(
+        user_id=user["id"],
+        challenge=options.challenge,
+        expires_at=time.time() + 300,
+        name=name,
+    )
+    return web.json_response(
+        {
+            "flowId": flow_id,
+            "publicKey": json.loads(options_to_json(options)),
+            "origin": origin,
+        }
+    )
+
+
+async def passkey_register_verify(request: web.Request) -> web.Response:
+    payload = await json_body(request)
+    flow_id = str(payload.get("flowId", ""))
+    credential = payload.get("credential")
+    ceremony = request.app["registration_ceremonies"].pop(flow_id, None)
+    if (
+        not ceremony
+        or ceremony.user_id != request["auth"].user_id
+        or ceremony.expires_at <= time.time()
+        or not isinstance(credential, dict)
+    ):
+        return json_error("Die Passkey-Anfrage ist abgelaufen.", 400)
+
+    origin, rp_id = webauthn_config(request)
     try:
-        payload = await request.json(loads=json.loads)
-    except (json.JSONDecodeError, TypeError):
-        raise web.HTTPBadRequest(
-            text=json.dumps({"error": "Ungültige Anfrage."}),
-            content_type="application/json",
+        verification = verify_registration_response(
+            credential=credential,
+            expected_challenge=ceremony.challenge,
+            expected_origin=origin,
+            expected_rp_id=rp_id,
+            require_user_verification=True,
         )
+    except InvalidRegistrationResponse:
+        return json_error("Der Passkey konnte nicht bestätigt werden.", 400)
+    transports = credential.get("response", {}).get("transports", [])
+    if not isinstance(transports, list):
+        transports = []
+    passkey = request.app["db"].add_passkey(
+        user_id=ceremony.user_id,
+        name=ceremony.name,
+        credential_id=verification.credential_id,
+        public_key=verification.credential_public_key,
+        sign_count=verification.sign_count,
+        transports=[str(item) for item in transports],
+    )
+    return web.json_response(passkey, status=201)
+
+
+async def delete_passkey(request: web.Request) -> web.Response:
+    deleted = request.app["db"].delete_passkey(
+        request["auth"].user_id,
+        int(request.match_info["passkey_id"]),
+    )
+    if not deleted:
+        raise web.HTTPNotFound()
+    return web.Response(status=204)
+
+
+async def domains(request: web.Request) -> web.Response:
+    return web.json_response(request.app["db"].list_domains())
+
+
+async def admin_users(request: web.Request) -> web.Response:
+    require_admin(request)
+    if request.method == "GET":
+        return web.json_response(request.app["db"].list_users())
+
+    payload = await json_body(request)
+    username = str(payload.get("username", "")).strip()
+    display_name = str(payload.get("displayName", "")).strip() or username
+    password = str(payload.get("password", ""))
+    if not APP_USERNAME_RE.fullmatch(username):
+        return json_error("Der Benutzername enthält ungültige Zeichen.", 400)
+    if not 1 <= len(display_name) <= 80:
+        return json_error("Der Anzeigename muss 1 bis 80 Zeichen lang sein.", 400)
+    validate_app_password(password)
+    user = request.app["db"].create_user(
+        username=username,
+        display_name=display_name,
+        password=password,
+        is_admin=bool(payload.get("isAdmin", False)),
+    )
+    return web.json_response(user, status=201)
+
+
+async def admin_user(request: web.Request) -> web.Response:
+    require_admin(request)
+    user_id = int(request.match_info["user_id"])
+    target = request.app["db"].get_user(user_id)
+    if not target:
+        raise web.HTTPNotFound()
+
+    if request.method == "DELETE":
+        if user_id == request["auth"].user_id:
+            return json_error("Das eigene Administratorkonto kann nicht gelöscht werden.", 400)
+        if target["enabled"] and target["is_admin"] and request.app["db"].enabled_admin_count() <= 1:
+            return json_error("Der letzte aktive Administrator kann nicht gelöscht werden.", 400)
+        revoked_sessions = request.app["auth"].delete_user_sessions(user_id)
+        await asyncio.gather(
+            *(request.app["sessions"].stop_owned(session_id) for session_id in revoked_sessions)
+        )
+        request.app["db"].delete_user(user_id)
+        return web.Response(status=204)
+
+    payload = await json_body(request)
+    display_name = str(payload.get("displayName", target["display_name"])).strip()
+    enabled = bool(payload.get("enabled", target["enabled"]))
+    is_admin = bool(payload.get("isAdmin", target["is_admin"]))
+    password = str(payload.get("password", "")) or None
+    if not 1 <= len(display_name) <= 80:
+        return json_error("Der Anzeigename muss 1 bis 80 Zeichen lang sein.", 400)
+    if password:
+        validate_app_password(password)
+    if user_id == request["auth"].user_id and (not enabled or not is_admin):
+        return json_error("Das eigene Administratorkonto muss aktiv und Administrator bleiben.", 400)
+    if (
+        target["enabled"]
+        and target["is_admin"]
+        and (not enabled or not is_admin)
+        and request.app["db"].enabled_admin_count() <= 1
+    ):
+        return json_error("Der letzte aktive Administrator kann nicht deaktiviert werden.", 400)
+    user = request.app["db"].update_user(
+        user_id=user_id,
+        display_name=display_name,
+        enabled=enabled,
+        is_admin=is_admin,
+        password=password,
+    )
+    if not enabled or (password and user_id != request["auth"].user_id):
+        revoked_sessions = request.app["auth"].delete_user_sessions(user_id)
+        await asyncio.gather(
+            *(request.app["sessions"].stop_owned(session_id) for session_id in revoked_sessions)
+        )
+    return web.json_response(user)
+
+
+async def admin_domains(request: web.Request) -> web.Response:
+    require_admin(request)
+    if request.method == "GET":
+        return web.json_response(request.app["db"].list_domains())
+    payload = await json_body(request)
+    name = str(payload.get("name", "")).strip()
+    if not DOMAIN_RE.fullmatch(name):
+        return json_error("Die Domäne enthält ungültige Zeichen.", 400)
+    return web.json_response(request.app["db"].add_domain(name), status=201)
+
+
+async def delete_domain(request: web.Request) -> web.Response:
+    require_admin(request)
+    if not request.app["db"].delete_domain(int(request.match_info["domain_id"])):
+        raise web.HTTPNotFound()
+    return web.Response(status=204)
+
+
+async def history(request: web.Request) -> web.Response:
+    return web.json_response(request.app["db"].list_history(request["auth"].user_id))
+
+
+async def delete_history(request: web.Request) -> web.Response:
+    deleted = request.app["db"].delete_history(
+        request["auth"].user_id,
+        int(request.match_info["history_id"]),
+    )
+    if not deleted:
+        raise web.HTTPNotFound()
+    return web.Response(status=204)
+
+
+async def create_session(request: web.Request) -> web.Response:
+    payload = await json_body(request)
+    connection = validate_connection(payload)
+    if not request.app["db"].domain_exists(connection["domain"]):
+        return json_error("Die ausgewählte Domäne ist nicht freigegeben.", 400)
     session = await request.app["sessions"].create(payload, request["auth"].session_id)
+    payload["password"] = ""
+    connection["password"] = ""
+    request.app["db"].save_history(request["auth"].user_id, connection)
     return web.json_response(
         {
             "id": session.session_id,
@@ -612,7 +753,6 @@ async def websocket_proxy(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(protocols=("binary",))
     await ws.prepare(request)
     session.websocket_count += 1
-
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", session.vnc_port)
 
@@ -657,21 +797,64 @@ async def on_startup(app: web.Application) -> None:
 
 async def on_cleanup(app: web.Application) -> None:
     await app["sessions"].close()
+    app["db"].close()
 
 
 def create_app() -> web.Application:
-    if not os.getenv("APP_USERNAME") or not os.getenv("APP_PASSWORD"):
+    bootstrap_username = os.getenv("APP_USERNAME", "").strip()
+    bootstrap_password = os.getenv("APP_PASSWORD", "")
+    if not bootstrap_username or not bootstrap_password:
         raise RuntimeError("APP_USERNAME und APP_PASSWORD müssen gesetzt sein.")
 
+    password_hasher = PasswordHasher()
+    database = Database(
+        path=os.getenv("DATABASE_PATH", "/data/servermanager.db"),
+        password_hasher=password_hasher,
+        bootstrap_username=bootstrap_username,
+        bootstrap_password=bootstrap_password,
+    )
     app = web.Application(
         middlewares=[api_error_middleware, security_middleware],
-        client_max_size=16 * 1024,
+        client_max_size=64 * 1024,
     )
     app["sessions"] = SessionManager()
     app["auth"] = AuthManager()
+    app["db"] = database
+    app["password_hasher"] = password_hasher
+    app["dummy_password_hash"] = password_hasher.hash(secrets.token_urlsafe(32))
+    app["login_ceremonies"] = {}
+    app["registration_ceremonies"] = {}
+    app["totp_pending"] = {}
+
     app.router.add_get("/", index)
-    app.router.add_route("*", "/login", login_page)
+    app.router.add_get("/login", login_page)
+    app.router.add_post("/api/login/password", password_login)
+    app.router.add_post("/api/login/passkey/options", passkey_login_options)
+    app.router.add_post("/api/login/passkey/verify", passkey_login_verify)
     app.router.add_post("/logout", logout)
+
+    app.router.add_get("/account", account_page)
+    app.router.add_get("/admin", admin_page)
+    app.router.add_get("/api/me", me)
+    app.router.add_post("/api/account/password", change_password)
+    app.router.add_post("/api/account/totp/setup", totp_setup)
+    app.router.add_post("/api/account/totp/enable", totp_enable)
+    app.router.add_post("/api/account/totp/disable", totp_disable)
+    app.router.add_post("/api/account/passkeys/options", passkey_register_options)
+    app.router.add_post("/api/account/passkeys/verify", passkey_register_verify)
+    app.router.add_delete("/api/account/passkeys/{passkey_id}", delete_passkey)
+
+    app.router.add_get("/api/admin/users", admin_users)
+    app.router.add_post("/api/admin/users", admin_users)
+    app.router.add_patch("/api/admin/users/{user_id}", admin_user)
+    app.router.add_delete("/api/admin/users/{user_id}", admin_user)
+    app.router.add_get("/api/admin/domains", admin_domains)
+    app.router.add_post("/api/admin/domains", admin_domains)
+    app.router.add_delete("/api/admin/domains/{domain_id}", delete_domain)
+
+    app.router.add_get("/api/domains", domains)
+    app.router.add_get("/api/history", history)
+    app.router.add_delete("/api/history/{history_id}", delete_history)
     app.router.add_post("/api/sessions", create_session)
     app.router.add_delete("/api/sessions/{session_id}", delete_session)
     app.router.add_get("/api/sessions/{session_id}/websocket", websocket_proxy)

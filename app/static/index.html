@@ -70,7 +70,7 @@
       text-align: right;
     }
     .header-actions { display: flex; align-items: flex-end; gap: 14px; }
-    .logout {
+    .logout, .header-link {
       min-height: 30px;
       border: 1px solid var(--line);
       border-radius: 7px;
@@ -79,7 +79,8 @@
       background: var(--panel-soft);
       font-size: .72rem;
     }
-    .logout:hover { color: var(--text); border-color: #365272; }
+    .header-link { display: grid; place-items: center; text-decoration: none; }
+    .logout:hover, .header-link:hover { color: var(--text); border-color: #365272; }
     .card {
       border: 1px solid var(--line);
       border-radius: 14px;
@@ -293,6 +294,8 @@
       </div>
       <div class="header-actions">
         <p class="intro">Isolierte Browsersitzung. Zugangsdaten werden nicht gespeichert.</p>
+        <a class="header-link" href="/account">Konto</a>
+        <a class="header-link" id="adminLink" href="/admin" hidden>Admin</a>
         <button class="logout" id="logout" type="button">Abmelden</button>
       </div>
     </header>
@@ -317,7 +320,9 @@
         </div>
         <div class="field">
           <label for="domain">Domäne (optional)</label>
-          <input id="domain" autocomplete="organization" placeholder="CONTOSO">
+          <select id="domain">
+            <option value="">Keine Domäne</option>
+          </select>
         </div>
       </div>
 
@@ -389,11 +394,9 @@
     const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
     const historyList = document.querySelector("#historyList");
     const historyCount = document.querySelector("#historyCount");
-    const historyKey = "servermanager.connectionHistory.v1";
-    const maxHistoryEntries = 8;
     let rfb = null;
     let sessionId = null;
-    let connectionHistory = loadHistory();
+    let connectionHistory = [];
 
     function setMessage(text) {
       message.textContent = text;
@@ -413,72 +416,28 @@
       }
     }
 
-    function loadHistory() {
-      try {
-        const stored = JSON.parse(localStorage.getItem(historyKey) || "[]");
-        if (!Array.isArray(stored)) return [];
-        return stored
-          .filter(entry =>
-            entry &&
-            typeof entry.host === "string" &&
-            Number.isInteger(entry.port) &&
-            typeof entry.username === "string"
-          )
-          .map(entry => ({
-            id: typeof entry.id === "string" ? entry.id : `${Date.now()}-${Math.random()}`,
-            host: entry.host,
-            port: entry.port,
-            username: entry.username,
-            domain: typeof entry.domain === "string" ? entry.domain : "",
-            resolution: typeof entry.resolution === "string" ? entry.resolution : "1600x900",
-            admin: Boolean(entry.admin),
-            clipboard: entry.clipboard !== false,
-            ignoreCertificate: Boolean(entry.ignoreCertificate),
-            lastUsed: Number(entry.lastUsed) || 0
-          }))
-          .slice(0, maxHistoryEntries);
-      } catch {
-        return [];
-      }
-    }
-
-    function persistHistory() {
-      try {
-        localStorage.setItem(historyKey, JSON.stringify(connectionHistory));
-      } catch {
-        setMessage("Der Browser konnte den Sitzungsverlauf nicht speichern.");
-      }
-    }
-
-    function historyIdentity(entry) {
-      return [
-        entry.host.toLowerCase(),
-        entry.port,
-        entry.username.toLowerCase(),
-        entry.domain.toLowerCase()
-      ].join("|");
-    }
-
-    function rememberConnection(payload) {
-      const entry = {
-        id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
-        host: payload.host,
-        port: payload.port,
-        username: payload.username,
-        domain: payload.domain,
-        resolution: payload.resolution,
-        admin: payload.admin,
-        clipboard: payload.clipboard,
-        ignoreCertificate: payload.ignoreCertificate,
-        lastUsed: Date.now()
-      };
-      const identity = historyIdentity(entry);
-      connectionHistory = [
-        entry,
-        ...connectionHistory.filter(item => historyIdentity(item) !== identity)
-      ].slice(0, maxHistoryEntries);
-      persistHistory();
+    async function loadHistory() {
+      const response = await fetch("/api/history");
+      const result = await readResponse(response);
+      if (!response.ok) throw new Error(result.error || "Der Sitzungsverlauf konnte nicht geladen werden.");
+      connectionHistory = result;
       renderHistory();
+    }
+
+    async function loadDomains() {
+      const response = await fetch("/api/domains");
+      const result = await readResponse(response);
+      if (!response.ok) throw new Error(result.error || "Die Domänen konnten nicht geladen werden.");
+      const select = document.querySelector("#domain");
+      select.replaceChildren(new Option("Keine Domäne", ""));
+      for (const domain of result) select.add(new Option(domain.name, domain.name));
+    }
+
+    async function loadUser() {
+      const response = await fetch("/api/me");
+      const result = await readResponse(response);
+      if (!response.ok) throw new Error(result.error || "Das Benutzerkonto konnte nicht geladen werden.");
+      document.querySelector("#adminLink").hidden = !result.isAdmin;
     }
 
     function fillFromHistory(entry) {
@@ -496,9 +455,17 @@
       setMessage("");
     }
 
-    function deleteHistoryEntry(id) {
+    async function deleteHistoryEntry(id) {
+      const response = await fetch(`/api/history/${id}`, {
+        method: "DELETE",
+        headers: { "X-CSRF-Token": csrfToken }
+      });
+      if (!response.ok) {
+        const result = await readResponse(response);
+        setMessage(result.error || "Der Eintrag konnte nicht gelöscht werden.");
+        return;
+      }
       connectionHistory = connectionHistory.filter(entry => entry.id !== id);
-      persistHistory();
       renderHistory();
     }
 
@@ -602,7 +569,7 @@
         const result = await readResponse(response);
         if (!response.ok) throw new Error(result.error || "Die Sitzung konnte nicht gestartet werden.");
 
-        rememberConnection(payload);
+        await loadHistory();
         document.querySelector("#password").value = "";
         sessionId = result.id;
         launcher.hidden = true;
@@ -657,7 +624,7 @@
         }).catch(() => {});
       }
     });
-    renderHistory();
+    Promise.all([loadHistory(), loadDomains(), loadUser()]).catch(error => setMessage(error.message));
   </script>
 </body>
 </html>

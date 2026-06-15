@@ -1,21 +1,20 @@
 # ServerManager
 
-ServerManager ist ein eigenständiger Browser-RDP-Gateway-MVP. Er startet pro
-Verbindung eine isolierte FreeRDP-Sitzung in einem virtuellen X11-Bildschirm und
-überträgt diesen über x11vnc, WebSocket und noVNC in den Browser.
+ServerManager ist ein eigenständiges Browser-RDP-Gateway. Pro Verbindung wird
+eine isolierte FreeRDP-Sitzung in einem virtuellen X11-Bildschirm gestartet und
+über x11vnc, WebSocket und noVNC in den Browser übertragen.
 
 ## Funktionen
 
 - RDP direkt im Browser, ohne `.rdp`-Download
-- IP/Hostname, Port, Benutzername und Domäne
+- Mehrbenutzerbetrieb mit Administrator- und Standardbenutzern
+- Argon2id-Passwörter, TOTP und Passkey-Anmeldung über WebAuthn
+- Benutzerbezogener, serverseitiger Verbindungsverlauf ohne RDP-Passwörter
+- Serverweit gepflegte Domänen als Auswahl im RDP-Formular
 - Administrative RDP-Sitzung über `/admin`
 - Zwischenablage und mehrere Bildschirmauflösungen
-- Browserlokaler Verlauf erfolgreicher Verbindungen ohne Passwortspeicherung
-- Parallele, voneinander getrennte Sitzungsprozesse
-- Automatische Zeitbegrenzung und Prozessbereinigung
-- Eigene Anmeldemaske mit zeitlich begrenzter, serverseitiger Sitzung
-- HttpOnly-Cookie, SameSite-Schutz und CSRF-Token
-- Keine persistente Speicherung von RDP-Passwörtern
+- Zeitbegrenzung und automatische Bereinigung der Sitzungsprozesse
+- HttpOnly-Cookie, SameSite-Schutz, Origin-Prüfung und CSRF-Token
 
 ## Start
 
@@ -25,98 +24,106 @@ cd ServerManager
 cp .env.example .env
 ```
 
-In `.env` unbedingt ein langes, zufälliges `APP_PASSWORD` setzen. Danach:
+In `.env` ein langes, zufälliges `APP_PASSWORD` setzen. `APP_USERNAME` und
+`APP_PASSWORD` erzeugen ausschließlich beim ersten Start den ersten
+Administrator. Spätere Änderungen erfolgen in der Weboberfläche.
 
 ```bash
 docker compose up -d --build
 docker compose logs -f
 ```
 
-Danach ist die Oberfläche im lokalen Netzwerk unter folgender Adresse erreichbar:
+Die Datenbank liegt im Docker-Volume `servermanager_data`. Dieses Volume muss
+bei Updates und Backups erhalten bleiben.
 
-```text
-http://IP-DES-LINUX-SERVERS:8080
-```
+## Nginx Proxy Manager
 
-Die Anwendung zeigt eine eigene Anmeldemaske. Dafür gelten `APP_USERNAME` und
-`APP_PASSWORD` aus der `.env`-Datei. Die Anmeldung wird standardmäßig acht
-Stunden gehalten und kann mit `AUTH_SESSION_SECONDS` angepasst werden.
-`BIND_ADDRESS=0.0.0.0` erlaubt den Zugriff aus dem LAN. Sobald Nginx mit HTTPS
-eingerichtet ist, sollte `BIND_ADDRESS` wieder auf `127.0.0.1` gesetzt werden.
-Eine Nginx-Vorlage liegt unter `nginx/servermanager.conf`.
-
-Bei Nginx Proxy Manager in `.env` zusätzlich die öffentliche Adresse setzen:
+Für den Betrieb hinter Nginx Proxy Manager:
 
 ```env
+BIND_ADDRESS=127.0.0.1
 PUBLIC_URL=https://rdp.example.internal
 ```
 
-Im Proxy Host muss **Websockets Support** aktiviert sein. Als Forward Scheme
-`http`, als Forward Host die IP des ServerManager-Hosts und als Forward Port
-`8080` verwenden. Bei aktuellen NPM-Versionen kann es bei WebSocket-Problemen
-helfen, HTTP/2 für diesen Proxy Host zu deaktivieren.
+Im Proxy Host:
 
-## Kein Zugriff vom PC
+- Forward Scheme `http`
+- Forward Host: IP des ServerManager-Hosts
+- Forward Port `8080`
+- **Websockets Support** aktivieren
+- gültiges TLS-Zertifikat verwenden
 
-Auf dem Linux-Server prüfen:
+Passkeys benötigen HTTPS. `WEBAUTHN_ORIGIN` und `WEBAUTHN_RP_ID` werden
+normalerweise aus `PUBLIC_URL` abgeleitet. Bei abweichenden Setups können sie
+explizit gesetzt werden:
 
-```bash
-docker compose ps
-docker compose logs --tail=100
-curl http://127.0.0.1:8080/healthz
-ss -lntp | grep 8080
+```env
+WEBAUTHN_ORIGIN=https://rdp.example.internal
+WEBAUTHN_RP_ID=rdp.example.internal
+WEBAUTHN_RP_NAME=ServerManager
+TOTP_ISSUER=ServerManager
 ```
 
-Falls UFW aktiv ist, Port 8080 nur für das eigene Management-Netz freigeben:
+Die WebAuthn-Origin muss exakt der im Browser verwendeten HTTPS-Adresse
+entsprechen. Die RP-ID ist nur der Hostname, ohne Schema oder Port.
 
-```bash
-sudo ufw allow from 192.168.1.0/24 to any port 8080 proto tcp
-```
+## Administration
 
-Danach die geänderte Bind-Adresse übernehmen:
+Nach der Anmeldung steht Administratoren der Bereich `/admin` zur Verfügung.
+Dort lassen sich Benutzer anlegen, deaktivieren, löschen, zu Administratoren
+machen und mit einem neuen Passwort versehen. Außerdem werden dort die
+Domänen gepflegt, die im RDP-Formular auswählbar sind.
 
-```bash
-docker compose down
-docker compose up -d --build
-```
+Unter `/account` kann jeder Benutzer:
 
-Die Server-IP lässt sich beispielsweise mit `hostname -I` anzeigen.
-
-## Voraussetzungen
-
-- Linux-Server mit Docker Engine und Docker Compose
-- Netzwerkzugriff des Containers auf die RDP-Zielserver
-- Nginx und ein gültiges TLS-Zertifikat
-- Firewall-Regeln, die den Zugriff auf die Weboberfläche beschränken
+- das eigene Passwort ändern
+- TOTP einrichten oder deaktivieren
+- Passkeys registrieren und löschen
 
 ## Sicherheit
 
-Die Anwendung ist ein administrativer MVP und sollte nur in einem geschützten
-Management-Netz betrieben werden.
+Die Anwendung sollte nur in einem geschützten Management-Netz betrieben
+werden.
 
-- Port 8080 ohne HTTPS nur vorübergehend in einem vertrauenswürdigen LAN verwenden.
 - Zugriff zusätzlich über VPN, Zero-Trust-Proxy oder IP-Allowlist begrenzen.
-- Ein eigenes starkes Gateway-Passwort setzen.
+- Port 8080 nicht ungeschützt aus dem Internet erreichbar machen.
+- Das persistente Datenvolume sichern und vor unbefugtem Zugriff schützen.
 - `Zertifikat ignorieren` nur für bekannte interne Systeme aktivieren.
-- Container nicht mit Host-Netzwerk oder privilegiert starten.
 - RDP-Ziele per Firewall auf den Gateway-Server beschränken.
 
-Das RDP-Passwort wird im Request empfangen, direkt über `stdin` an FreeRDP
-übergeben, danach aus dem Session-Payload entfernt und weder protokolliert noch
-auf einem Datenträger gespeichert.
+RDP-Passwörter werden nur im Request empfangen, direkt über `stdin` an FreeRDP
+übergeben und danach aus dem Arbeitsspeicher-Payload entfernt. Sie werden weder
+im Verlauf noch in SQLite gespeichert. TOTP-Schlüssel müssen zur Verifikation
+serverseitig in der geschützten SQLite-Datenbank gespeichert werden.
 
 ## Architektur
 
 ```text
-Browser -> Nginx/TLS -> aiohttp WebSocket-Proxy -> x11vnc
-                                                -> Xvfb/Openbox
-                                                -> FreeRDP -> Windows Server
+Browser -> Nginx/TLS -> aiohttp -> SQLite
+                         |
+                         +-> WebSocket -> x11vnc -> Xvfb/Openbox
+                                                   -> FreeRDP -> Windows Server
 ```
 
-## Grenzen des MVP
+Wichtige Dateien:
 
-- Kein Benutzerverzeichnis und keine gespeicherten Serverprofile
-- Keine Sitzungsaufzeichnung oder zentrale Audit-Datenbank
-- Feste Auflösung während einer laufenden Sitzung
-- Zwischenablage hängt von FreeRDP, x11vnc und Browser-Unterstützung ab
-- Noch kein Kubernetes- oder Multi-Node-Scheduler
+- `app/server.py`: HTTP, Authentifizierung, WebAuthn, TOTP und APIs
+- `app/storage.py`: SQLite-Schema und persistente Daten
+- `app/rdp.py`: RDP-, X11- und VNC-Prozessverwaltung
+- `app/static/`: Login, RDP-Oberfläche, Konto und Administration
+- `docker-compose.yml`: Laufzeit, Datenvolume und Konfiguration
+
+## Entwicklung
+
+Backendtests:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## Grenzen
+
+- Keine Sitzungsaufzeichnung
+- Kein zentraler Multi-Node-Scheduler
+- Feste Auflösung während einer laufenden RDP-Sitzung
+- Passkeys funktionieren nur unter HTTPS oder auf `localhost`

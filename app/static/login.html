@@ -7,23 +7,16 @@
   <title>Anmelden · ServerManager</title>
   <style>
     :root {
-      --bg: #08111d;
-      --panel: #0d1929;
-      --text: #eef5ff;
-      --muted: #91a2b9;
-      --line: #243a55;
-      --accent: #4f8cff;
-      --accent-dark: #ffffff;
-      --danger: #ff8f9a;
+      --bg: #08111d; --panel: #0d1929; --text: #eef5ff; --muted: #91a2b9;
+      --line: #243a55; --accent: #4f8cff; --danger: #ff8f9a;
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; min-height: 100%; }
     body {
-      display: flex;
+      display: grid;
       min-height: 100vh;
       min-height: 100svh;
-      align-items: center;
-      justify-content: center;
+      place-items: center;
       padding: 24px;
       color: var(--text);
       background:
@@ -32,92 +25,203 @@
         var(--bg);
       font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    .login { flex: 0 0 auto; width: min(360px, 100%); }
+    .login { width: min(370px, 100%); }
     .brand {
-      margin-bottom: 16px;
-      color: var(--accent);
-      font-size: .7rem;
-      font-weight: 800;
-      letter-spacing: .13em;
-      text-transform: uppercase;
+      margin-bottom: 16px; color: var(--accent); font-size: .7rem; font-weight: 800;
+      letter-spacing: .13em; text-transform: uppercase;
     }
     .card {
-      padding: 24px;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      background: rgba(13, 25, 41, .96);
-      box-shadow: 0 22px 60px rgba(0, 0, 0, .32);
+      padding: 24px; border: 1px solid var(--line); border-radius: 14px;
+      background: rgba(13, 25, 41, .96); box-shadow: 0 22px 60px rgba(0, 0, 0, .32);
     }
     h1 { margin: 0 0 5px; font-size: 1.55rem; letter-spacing: -.03em; }
     .intro { margin: 0 0 20px; color: var(--muted); font-size: .8rem; }
     .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 13px; }
     label { font-size: .76rem; font-weight: 700; }
     input {
-      width: 100%;
-      height: 42px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      outline: none;
-      padding: 0 11px;
-      color: var(--text);
-      background: #09182b;
-      font: inherit;
+      width: 100%; height: 42px; border: 1px solid var(--line); border-radius: 8px;
+      outline: none; padding: 0 11px; color: var(--text); background: #09182b; font: inherit;
     }
     input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79, 140, 255, .14); }
     button {
-      width: 100%;
-      min-height: 42px;
-      margin-top: 4px;
-      border: 0;
-      border-radius: 8px;
-      color: var(--accent-dark);
-      background: var(--accent);
-      font: 800 .82rem/1 inherit;
-      cursor: pointer;
+      width: 100%; min-height: 42px; border: 0; border-radius: 8px;
+      color: #fff; background: var(--accent); font: 800 .82rem/1 inherit; cursor: pointer;
     }
+    button:disabled { cursor: wait; opacity: .6; }
+    .secondary {
+      margin-top: 9px; border: 1px solid var(--line); color: var(--text); background: #111f32;
+    }
+    .divider {
+      display: flex; align-items: center; gap: 10px; margin: 16px 0 7px;
+      color: var(--muted); font-size: .68rem;
+    }
+    .divider::before, .divider::after { content: ""; height: 1px; flex: 1; background: var(--line); }
     .error {
-      display: none;
-      margin: 0 0 13px;
-      padding: 9px 10px;
-      border: 1px solid rgba(255, 143, 154, .35);
-      border-radius: 8px;
-      color: var(--danger);
-      background: rgba(255, 143, 154, .07);
-      font-size: .75rem;
+      display: none; margin: 0 0 13px; padding: 9px 10px;
+      border: 1px solid rgba(255, 143, 154, .35); border-radius: 8px;
+      color: var(--danger); background: rgba(255, 143, 154, .07); font-size: .75rem;
     }
     .error.visible { display: block; }
     .footer { margin: 13px 0 0; color: var(--muted); font-size: .7rem; text-align: center; }
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
   <main class="login">
     <div class="brand">ServerManager · RDP Gateway</div>
-    <form class="card" method="post" action="/login">
+    <form class="card" id="loginForm">
       <h1>Anmelden</h1>
       <p class="intro">Zugriff auf die Serververwaltung</p>
       <div class="error" id="error" role="alert"></div>
       <div class="field">
         <label for="username">Benutzername</label>
-        <input id="username" name="username" autocomplete="username" required>
+        <input id="username" autocomplete="username webauthn" required autofocus>
       </div>
       <div class="field">
         <label for="password">Passwort</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <input id="password" type="password" autocomplete="current-password" required>
       </div>
-      <button type="submit">Anmelden</button>
+      <div class="field" id="totpField" hidden>
+        <label for="totp">TOTP-Code</label>
+        <input id="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6">
+      </div>
+      <button id="loginButton" type="submit">Anmelden</button>
+      <div class="divider">oder</div>
+      <button class="secondary" id="passkeyButton" type="button">Mit Passkey anmelden</button>
     </form>
     <p class="footer">Geschützter administrativer Zugriff</p>
   </main>
   <script>
-    const params = new URLSearchParams(location.search);
+    const form = document.querySelector("#loginForm");
     const error = document.querySelector("#error");
-    if (params.has("locked")) {
-      error.textContent = "Zu viele Fehlversuche. Bitte in einigen Minuten erneut versuchen.";
-      error.classList.add("visible");
-    } else if (params.has("error")) {
-      error.textContent = "Benutzername oder Passwort ist nicht korrekt.";
-      error.classList.add("visible");
+    const loginButton = document.querySelector("#loginButton");
+    const passkeyButton = document.querySelector("#passkeyButton");
+    const totpField = document.querySelector("#totpField");
+
+    function showError(message) {
+      error.textContent = message;
+      error.classList.toggle("visible", Boolean(message));
     }
+
+    async function readResponse(response) {
+      const text = await response.text();
+      if (!text) return {};
+      try { return JSON.parse(text); }
+      catch { return { error: "Der Server hat eine ungültige Antwort geliefert." }; }
+    }
+
+    function decodeBase64url(value) {
+      const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
+      return Uint8Array.from(atob(padded), character => character.charCodeAt(0));
+    }
+
+    function encodeBase64url(value) {
+      const bytes = new Uint8Array(value);
+      let binary = "";
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    function prepareRequestOptions(options) {
+      options.challenge = decodeBase64url(options.challenge);
+      options.allowCredentials = (options.allowCredentials || []).map(item => ({
+        ...item,
+        id: decodeBase64url(item.id)
+      }));
+      return options;
+    }
+
+    function credentialToJSON(credential) {
+      return {
+        id: credential.id,
+        rawId: encodeBase64url(credential.rawId),
+        type: credential.type,
+        authenticatorAttachment: credential.authenticatorAttachment,
+        clientExtensionResults: credential.getClientExtensionResults(),
+        response: {
+          authenticatorData: encodeBase64url(credential.response.authenticatorData),
+          clientDataJSON: encodeBase64url(credential.response.clientDataJSON),
+          signature: encodeBase64url(credential.response.signature),
+          userHandle: credential.response.userHandle
+            ? encodeBase64url(credential.response.userHandle)
+            : null
+        }
+      };
+    }
+
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      showError("");
+      loginButton.disabled = true;
+      const payload = {
+        username: document.querySelector("#username").value.trim(),
+        password: document.querySelector("#password").value,
+        totp: document.querySelector("#totp").value.trim()
+      };
+      try {
+        const response = await fetch("/api/login/password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await readResponse(response);
+        if (response.status === 202 && result.totpRequired) {
+          totpField.hidden = false;
+          document.querySelector("#totp").required = true;
+          document.querySelector("#totp").focus();
+          return;
+        }
+        if (!response.ok) throw new Error(result.error || "Anmeldung fehlgeschlagen.");
+        location.assign("/");
+      } catch (caught) {
+        showError(caught.message);
+      } finally {
+        loginButton.disabled = false;
+      }
+    });
+
+    passkeyButton.addEventListener("click", async () => {
+      showError("");
+      if (!window.PublicKeyCredential) {
+        showError("Dieser Browser unterstützt keine Passkeys.");
+        return;
+      }
+      const username = document.querySelector("#username").value.trim();
+      if (!username) {
+        showError("Bitte zuerst den Benutzernamen eingeben.");
+        document.querySelector("#username").focus();
+        return;
+      }
+      passkeyButton.disabled = true;
+      try {
+        const optionsResponse = await fetch("/api/login/passkey/options", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username })
+        });
+        const optionsResult = await readResponse(optionsResponse);
+        if (!optionsResponse.ok) throw new Error(optionsResult.error);
+        const credential = await navigator.credentials.get({
+          publicKey: prepareRequestOptions(optionsResult.publicKey)
+        });
+        const verifyResponse = await fetch("/api/login/passkey/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            flowId: optionsResult.flowId,
+            credential: credentialToJSON(credential)
+          })
+        });
+        const verifyResult = await readResponse(verifyResponse);
+        if (!verifyResponse.ok) throw new Error(verifyResult.error || "Passkey-Anmeldung fehlgeschlagen.");
+        location.assign("/");
+      } catch (caught) {
+        if (caught.name !== "NotAllowedError") showError(caught.message);
+      } finally {
+        passkeyButton.disabled = false;
+      }
+    });
   </script>
 </body>
 </html>

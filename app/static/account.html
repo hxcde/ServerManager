@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="csrf-token" content="__CSRF_TOKEN__">
+  <title>Konto · ServerManager</title>
+  <style>
+    :root {
+      --bg:#08111d; --panel:#0d1929; --soft:#111f32; --text:#eef5ff;
+      --muted:#91a2b9; --line:#243a55; --accent:#4f8cff; --danger:#ff6f7d;
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0; min-height:100vh; padding:28px 16px; color:var(--text);
+      background:radial-gradient(circle at 15% 8%,rgba(52,122,171,.16),transparent 30rem),var(--bg);
+      font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+    }
+    main { width:min(900px,100%); margin:auto; }
+    header { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:18px; }
+    .eyebrow { color:var(--accent); font-size:.68rem; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+    h1 { margin:4px 0 0; font-size:2rem; letter-spacing:-.04em; }
+    h2 { margin:0 0 4px; font-size:1rem; }
+    p { color:var(--muted); }
+    nav { display:flex; gap:8px; }
+    a,button {
+      min-height:36px; border:1px solid var(--line); border-radius:8px; padding:0 12px;
+      color:var(--text); background:var(--soft); font:inherit; font-size:.76rem;
+      text-decoration:none; cursor:pointer;
+    }
+    a { display:grid; place-items:center; }
+    button.primary { border:0; color:#fff; background:var(--accent); font-weight:800; }
+    button.danger { color:var(--danger); border-color:rgba(255,111,125,.4); background:rgba(255,111,125,.07); }
+    button:disabled { opacity:.6; cursor:wait; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    .card { padding:20px; border:1px solid var(--line); border-radius:14px; background:rgba(13,25,41,.95); }
+    .wide { grid-column:1/-1; }
+    .section-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:16px; }
+    .section-head p { margin:0; font-size:.74rem; }
+    .field { display:flex; flex-direction:column; gap:6px; margin-bottom:12px; }
+    label { font-size:.74rem; font-weight:700; }
+    input {
+      width:100%; height:40px; border:1px solid var(--line); border-radius:8px; outline:none;
+      padding:0 11px; color:var(--text); background:#09182b; font:inherit;
+    }
+    input:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(79,140,255,.14); }
+    .message { min-height:18px; margin:10px 0 0; color:var(--muted); font-size:.74rem; }
+    .message.error { color:#ff9aa4; }
+    .status { display:inline-flex; align-items:center; min-height:26px; padding:0 9px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:.68rem; }
+    .list { display:grid; gap:8px; }
+    .list-item { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 12px; border:1px solid var(--line); border-radius:9px; background:#0e1d30; }
+    .list-item strong,.list-item small { display:block; }
+    .list-item small { margin-top:2px; color:var(--muted); font-size:.68rem; }
+    .empty { margin:0; padding:18px; border:1px dashed var(--line); border-radius:9px; text-align:center; font-size:.74rem; }
+    .setup { display:grid; grid-template-columns:150px 1fr; gap:16px; align-items:center; margin-top:14px; padding:14px; border:1px solid var(--line); border-radius:10px; background:#09182b; }
+    .setup img { width:150px; height:150px; padding:8px; border-radius:8px; background:#fff; }
+    code { display:block; margin:7px 0 12px; color:#bcd5ff; overflow-wrap:anywhere; }
+    [hidden] { display:none !important; }
+    @media(max-width:700px){ .grid{grid-template-columns:1fr}.wide{grid-column:auto}.setup{grid-template-columns:1fr}.setup img{margin:auto}header{align-items:flex-start;flex-direction:column} }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><div class="eyebrow">ServerManager</div><h1>Kontosicherheit</h1></div>
+      <nav><a href="/">RDP</a><a id="adminLink" href="/admin" hidden>Administration</a></nav>
+    </header>
+    <div class="grid">
+      <section class="card">
+        <div class="section-head">
+          <div><h2>Passwort ändern</h2><p>Mindestens 12 Zeichen verwenden.</p></div>
+        </div>
+        <form id="passwordForm">
+          <div class="field"><label for="currentPassword">Aktuelles Passwort</label><input id="currentPassword" type="password" autocomplete="current-password" required></div>
+          <div class="field"><label for="newPassword">Neues Passwort</label><input id="newPassword" type="password" autocomplete="new-password" minlength="12" required></div>
+          <button class="primary" type="submit">Passwort speichern</button>
+        </form>
+        <div class="message" id="passwordMessage"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div><h2>TOTP</h2><p>Zusätzlicher Code bei Passwortanmeldung.</p></div>
+          <span class="status" id="totpStatus">Wird geladen</span>
+        </div>
+        <button class="primary" id="setupTotp" type="button">TOTP einrichten</button>
+        <form id="disableTotpForm" hidden>
+          <div class="field"><label for="disableCode">Aktueller TOTP-Code</label><input id="disableCode" inputmode="numeric" maxlength="6" required></div>
+          <button class="danger" type="submit">TOTP deaktivieren</button>
+        </form>
+        <div class="setup" id="totpSetup" hidden>
+          <img id="totpQr" alt="TOTP QR-Code">
+          <div>
+            <div>QR-Code scannen oder Schlüssel eingeben:</div>
+            <code id="totpSecret"></code>
+            <form id="enableTotpForm">
+              <div class="field"><label for="enableCode">Code zur Bestätigung</label><input id="enableCode" inputmode="numeric" maxlength="6" required></div>
+              <button class="primary" type="submit">TOTP aktivieren</button>
+            </form>
+          </div>
+        </div>
+        <div class="message" id="totpMessage"></div>
+      </section>
+
+      <section class="card wide">
+        <div class="section-head">
+          <div><h2>Passkeys</h2><p>Windows Hello, Sicherheitsschlüssel oder andere FIDO2-Geräte.</p></div>
+        </div>
+        <form id="passkeyForm" style="display:flex;gap:8px;margin-bottom:14px">
+          <input id="passkeyName" placeholder="z. B. Arbeits-PC" maxlength="80" required>
+          <button class="primary" type="submit">Passkey hinzufügen</button>
+        </form>
+        <div class="list" id="passkeyList"></div>
+        <div class="message" id="passkeyMessage"></div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const csrf = document.querySelector('meta[name="csrf-token"]').content;
+    let currentUser;
+
+    async function api(url, options = {}) {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(options.method && options.method !== "GET" ? { "X-CSRF-Token": csrf } : {}),
+          ...options.headers
+        }
+      });
+      const text = await response.text();
+      let data = {};
+      if (text) { try { data = JSON.parse(text); } catch { data = { error: "Ungültige Serverantwort." }; } }
+      if (!response.ok) throw new Error(data.error || "Die Aktion ist fehlgeschlagen.");
+      return data;
+    }
+
+    function message(id, text, error = false) {
+      const element = document.querySelector(id);
+      element.textContent = text;
+      element.classList.toggle("error", error);
+    }
+
+    function decodeBase64url(value) {
+      const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
+      return Uint8Array.from(atob(padded), character => character.charCodeAt(0));
+    }
+
+    function encodeBase64url(value) {
+      const bytes = new Uint8Array(value);
+      let binary = "";
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    function prepareCreationOptions(options) {
+      options.challenge = decodeBase64url(options.challenge);
+      options.user.id = decodeBase64url(options.user.id);
+      options.excludeCredentials = (options.excludeCredentials || []).map(item => ({
+        ...item, id: decodeBase64url(item.id)
+      }));
+      return options;
+    }
+
+    function registrationToJSON(credential) {
+      return {
+        id: credential.id,
+        rawId: encodeBase64url(credential.rawId),
+        type: credential.type,
+        authenticatorAttachment: credential.authenticatorAttachment,
+        clientExtensionResults: credential.getClientExtensionResults(),
+        response: {
+          attestationObject: encodeBase64url(credential.response.attestationObject),
+          clientDataJSON: encodeBase64url(credential.response.clientDataJSON),
+          transports: credential.response.getTransports ? credential.response.getTransports() : []
+        }
+      };
+    }
+
+    async function loadAccount() {
+      currentUser = await api("/api/me");
+      document.querySelector("#adminLink").hidden = !currentUser.isAdmin;
+      document.querySelector("#totpStatus").textContent = currentUser.totpEnabled ? "Aktiv" : "Nicht aktiv";
+      document.querySelector("#setupTotp").hidden = currentUser.totpEnabled;
+      document.querySelector("#disableTotpForm").hidden = !currentUser.totpEnabled;
+      renderPasskeys();
+    }
+
+    function renderPasskeys() {
+      const list = document.querySelector("#passkeyList");
+      list.replaceChildren();
+      if (!currentUser.passkeys.length) {
+        const empty = document.createElement("p");
+        empty.className = "empty";
+        empty.textContent = "Noch kein Passkey hinterlegt.";
+        list.append(empty);
+        return;
+      }
+      for (const passkey of currentUser.passkeys) {
+        const row = document.createElement("div");
+        row.className = "list-item";
+        const info = document.createElement("div");
+        const name = document.createElement("strong");
+        name.textContent = passkey.name;
+        const details = document.createElement("small");
+        details.textContent = new Date(passkey.createdAt * 1000).toLocaleDateString("de-DE");
+        info.append(name, details);
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "danger";
+        remove.textContent = "Löschen";
+        remove.addEventListener("click", async () => {
+          try {
+            await api(`/api/account/passkeys/${passkey.id}`, { method: "DELETE" });
+            currentUser.passkeys = currentUser.passkeys.filter(item => item.id !== passkey.id);
+            renderPasskeys();
+          } catch (caught) { message("#passkeyMessage", caught.message, true); }
+        });
+        row.append(info, remove);
+        list.append(row);
+      }
+    }
+
+    document.querySelector("#passwordForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const submittedForm = event.currentTarget;
+      try {
+        await api("/api/account/password", {
+          method: "POST",
+          body: JSON.stringify({
+            currentPassword: document.querySelector("#currentPassword").value,
+            newPassword: document.querySelector("#newPassword").value
+          })
+        });
+        submittedForm.reset();
+        message("#passwordMessage", "Passwort wurde geändert.");
+      } catch (caught) { message("#passwordMessage", caught.message, true); }
+    });
+
+    document.querySelector("#setupTotp").addEventListener("click", async () => {
+      try {
+        const setup = await api("/api/account/totp/setup", { method: "POST", body: "{}" });
+        document.querySelector("#totpQr").src = setup.qrCode;
+        document.querySelector("#totpSecret").textContent = setup.secret;
+        document.querySelector("#totpSetup").hidden = false;
+      } catch (caught) { message("#totpMessage", caught.message, true); }
+    });
+
+    document.querySelector("#enableTotpForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      try {
+        await api("/api/account/totp/enable", {
+          method: "POST",
+          body: JSON.stringify({ code: document.querySelector("#enableCode").value })
+        });
+        document.querySelector("#totpSetup").hidden = true;
+        message("#totpMessage", "TOTP ist jetzt aktiv.");
+        await loadAccount();
+      } catch (caught) { message("#totpMessage", caught.message, true); }
+    });
+
+    document.querySelector("#disableTotpForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const submittedForm = event.currentTarget;
+      try {
+        await api("/api/account/totp/disable", {
+          method: "POST",
+          body: JSON.stringify({ code: document.querySelector("#disableCode").value })
+        });
+        submittedForm.reset();
+        message("#totpMessage", "TOTP wurde deaktiviert.");
+        await loadAccount();
+      } catch (caught) { message("#totpMessage", caught.message, true); }
+    });
+
+    document.querySelector("#passkeyForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const submittedForm = event.currentTarget;
+      if (!window.PublicKeyCredential) {
+        message("#passkeyMessage", "Dieser Browser unterstützt keine Passkeys.", true);
+        return;
+      }
+      try {
+        const options = await api("/api/account/passkeys/options", {
+          method: "POST",
+          body: JSON.stringify({ name: document.querySelector("#passkeyName").value.trim() })
+        });
+        const credential = await navigator.credentials.create({
+          publicKey: prepareCreationOptions(options.publicKey)
+        });
+        const passkey = await api("/api/account/passkeys/verify", {
+          method: "POST",
+          body: JSON.stringify({
+            flowId: options.flowId,
+            credential: registrationToJSON(credential)
+          })
+        });
+        currentUser.passkeys.unshift(passkey);
+        submittedForm.reset();
+        renderPasskeys();
+        message("#passkeyMessage", "Passkey wurde hinzugefügt.");
+      } catch (caught) {
+        if (caught.name !== "NotAllowedError") message("#passkeyMessage", caught.message, true);
+      }
+    });
+
+    loadAccount().catch(caught => message("#passkeyMessage", caught.message, true));
+  </script>
+</body>
+</html>

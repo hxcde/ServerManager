@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="csrf-token" content="__CSRF_TOKEN__">
+  <title>Administration · ServerManager</title>
+  <style>
+    :root {
+      --bg:#08111d; --panel:#0d1929; --soft:#111f32; --text:#eef5ff;
+      --muted:#91a2b9; --line:#243a55; --accent:#4f8cff; --danger:#ff6f7d;
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0; min-height:100vh; padding:28px 16px; color:var(--text);
+      background:radial-gradient(circle at 15% 8%,rgba(52,122,171,.16),transparent 30rem),var(--bg);
+      font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+    }
+    main { width:min(1100px,100%); margin:auto; }
+    header { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:18px; }
+    .eyebrow { color:var(--accent); font-size:.68rem; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+    h1 { margin:4px 0 0; font-size:2rem; letter-spacing:-.04em; }
+    h2 { margin:0; font-size:1rem; }
+    nav { display:flex; gap:8px; }
+    a,button {
+      min-height:36px; border:1px solid var(--line); border-radius:8px; padding:0 12px;
+      color:var(--text); background:var(--soft); font:inherit; font-size:.76rem;
+      text-decoration:none; cursor:pointer;
+    }
+    a { display:grid; place-items:center; }
+    button.primary { border:0; background:var(--accent); color:#fff; font-weight:800; }
+    button.danger { color:var(--danger); border-color:rgba(255,111,125,.4); background:rgba(255,111,125,.07); }
+    .layout { display:grid; gap:14px; }
+    .card { padding:20px; border:1px solid var(--line); border-radius:14px; background:rgba(13,25,41,.95); }
+    .section-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; }
+    .create-grid { display:grid; grid-template-columns:1fr 1fr 1fr auto auto; gap:8px; align-items:end; }
+    .field { display:flex; flex-direction:column; gap:5px; }
+    label { color:#dce8f8; font-size:.7rem; font-weight:700; }
+    input {
+      width:100%; height:38px; border:1px solid var(--line); border-radius:8px; outline:none;
+      padding:0 10px; color:var(--text); background:#09182b; font:inherit;
+    }
+    input:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(79,140,255,.14); }
+    .checkbox { display:flex; align-items:center; gap:7px; min-height:38px; color:var(--muted); font-size:.74rem; }
+    .checkbox input { width:15px; height:15px; accent-color:var(--accent); }
+    .list { display:grid; gap:8px; margin-top:16px; }
+    .user {
+      display:grid; grid-template-columns:minmax(140px,1fr) minmax(150px,1fr) auto auto minmax(150px,1fr) auto auto;
+      gap:8px; align-items:center; padding:10px; border:1px solid var(--line); border-radius:10px; background:#0e1d30;
+    }
+    .identity strong,.identity small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .identity small { color:var(--muted); font-size:.67rem; }
+    .domain-form { display:flex; gap:8px; }
+    .domain-form input { max-width:360px; }
+    .domain-list { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+    .domain { display:flex; align-items:center; gap:8px; padding:7px 8px 7px 11px; border:1px solid var(--line); border-radius:999px; background:#0e1d30; }
+    .domain button { min-height:26px; padding:0 8px; border-radius:999px; }
+    .message { min-height:18px; margin:10px 0 0; color:var(--muted); font-size:.74rem; }
+    .message.error { color:#ff9aa4; }
+    .empty { color:var(--muted); font-size:.74rem; }
+    @media(max-width:900px){.create-grid,.user{grid-template-columns:1fr 1fr}.user .identity{grid-column:1/-1}}
+    @media(max-width:600px){header{align-items:flex-start;flex-direction:column}.create-grid,.user{grid-template-columns:1fr}.user .identity{grid-column:auto}.domain-form{flex-direction:column}.domain-form input{max-width:none}}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><div class="eyebrow">ServerManager</div><h1>Administration</h1></div>
+      <nav><a href="/">RDP</a><a href="/account">Mein Konto</a></nav>
+    </header>
+    <div class="layout">
+      <section class="card">
+        <div class="section-head"><h2>Benutzer</h2></div>
+        <form class="create-grid" id="createUser">
+          <div class="field"><label for="username">Benutzername</label><input id="username" maxlength="64" required></div>
+          <div class="field"><label for="displayName">Anzeigename</label><input id="displayName" maxlength="80"></div>
+          <div class="field"><label for="password">Startpasswort</label><input id="password" type="password" minlength="12" required></div>
+          <label class="checkbox"><input id="isAdmin" type="checkbox"> Administrator</label>
+          <button class="primary" type="submit">Anlegen</button>
+        </form>
+        <div class="list" id="userList"></div>
+        <div class="message" id="userMessage"></div>
+      </section>
+      <section class="card">
+        <div class="section-head"><h2>Serverweite Domänen</h2></div>
+        <form class="domain-form" id="domainForm">
+          <input id="domainName" placeholder="z. B. CONTOSO" maxlength="128" required>
+          <button class="primary" type="submit">Domäne hinzufügen</button>
+        </form>
+        <div class="domain-list" id="domainList"></div>
+        <div class="message" id="domainMessage"></div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const csrf = document.querySelector('meta[name="csrf-token"]').content;
+    let users = [];
+    let currentUser;
+    let domainItems = [];
+
+    async function api(url, options = {}) {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(options.method && options.method !== "GET" ? { "X-CSRF-Token": csrf } : {}),
+          ...options.headers
+        }
+      });
+      const text = await response.text();
+      let data = {};
+      if (text) { try { data = JSON.parse(text); } catch { data = { error: "Ungültige Serverantwort." }; } }
+      if (!response.ok) throw new Error(data.error || "Die Aktion ist fehlgeschlagen.");
+      return data;
+    }
+
+    function message(id, text, error = false) {
+      const element = document.querySelector(id);
+      element.textContent = text;
+      element.classList.toggle("error", error);
+    }
+
+    async function load() {
+      [currentUser, users, domainItems] = await Promise.all([
+        api("/api/me"),
+        api("/api/admin/users"),
+        api("/api/admin/domains")
+      ]);
+      renderUsers();
+      renderDomains();
+    }
+
+    function renderUsers() {
+      const list = document.querySelector("#userList");
+      list.replaceChildren();
+      for (const user of users) {
+        const row = document.createElement("div");
+        row.className = "user";
+
+        const identity = document.createElement("div");
+        identity.className = "identity";
+        const username = document.createElement("strong");
+        username.textContent = user.username;
+        const factors = document.createElement("small");
+        factors.textContent = `${user.passkeyCount} Passkey(s) · TOTP ${user.totpEnabled ? "aktiv" : "aus"}`;
+        identity.append(username, factors);
+
+        const displayName = document.createElement("input");
+        displayName.value = user.displayName;
+        displayName.maxLength = 80;
+        displayName.setAttribute("aria-label", `Anzeigename für ${user.username}`);
+
+        const enabledLabel = document.createElement("label");
+        enabledLabel.className = "checkbox";
+        const enabled = document.createElement("input");
+        enabled.type = "checkbox";
+        enabled.checked = user.enabled;
+        enabled.disabled = user.id === currentUser.id;
+        enabledLabel.append(enabled, document.createTextNode("Aktiv"));
+
+        const adminLabel = document.createElement("label");
+        adminLabel.className = "checkbox";
+        const admin = document.createElement("input");
+        admin.type = "checkbox";
+        admin.checked = user.isAdmin;
+        admin.disabled = user.id === currentUser.id;
+        adminLabel.append(admin, document.createTextNode("Admin"));
+
+        const password = document.createElement("input");
+        password.type = "password";
+        password.placeholder = "Neues Passwort (optional)";
+        password.minLength = 12;
+        password.setAttribute("aria-label", `Neues Passwort für ${user.username}`);
+
+        const save = document.createElement("button");
+        save.type = "button";
+        save.className = "primary";
+        save.textContent = "Speichern";
+        save.addEventListener("click", async () => {
+          try {
+            const updated = await api(`/api/admin/users/${user.id}`, {
+              method: "PATCH",
+              body: JSON.stringify({
+                displayName: displayName.value.trim(),
+                enabled: enabled.checked,
+                isAdmin: admin.checked,
+                password: password.value
+              })
+            });
+            Object.assign(user, updated);
+            password.value = "";
+            message("#userMessage", `${user.username} wurde gespeichert.`);
+            renderUsers();
+          } catch (caught) { message("#userMessage", caught.message, true); }
+        });
+
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "danger";
+        remove.textContent = "Löschen";
+        remove.disabled = user.id === currentUser.id;
+        remove.addEventListener("click", async () => {
+          if (!confirm(`Benutzer ${user.username} wirklich löschen?`)) return;
+          try {
+            await api(`/api/admin/users/${user.id}`, { method: "DELETE" });
+            users = users.filter(item => item.id !== user.id);
+            renderUsers();
+          } catch (caught) { message("#userMessage", caught.message, true); }
+        });
+
+        row.append(identity, displayName, enabledLabel, adminLabel, password, save, remove);
+        list.append(row);
+      }
+    }
+
+    function renderDomains() {
+      const list = document.querySelector("#domainList");
+      list.replaceChildren();
+      if (!domainItems.length) {
+        const empty = document.createElement("span");
+        empty.className = "empty";
+        empty.textContent = "Noch keine Domäne hinterlegt.";
+        list.append(empty);
+        return;
+      }
+      for (const domain of domainItems) {
+        const item = document.createElement("div");
+        item.className = "domain";
+        const name = document.createElement("span");
+        name.textContent = domain.name;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "danger";
+        remove.textContent = "Löschen";
+        remove.addEventListener("click", async () => {
+          try {
+            await api(`/api/admin/domains/${domain.id}`, { method: "DELETE" });
+            domainItems = domainItems.filter(item => item.id !== domain.id);
+            renderDomains();
+          } catch (caught) { message("#domainMessage", caught.message, true); }
+        });
+        item.append(name, remove);
+        list.append(item);
+      }
+    }
+
+    document.querySelector("#createUser").addEventListener("submit", async event => {
+      event.preventDefault();
+      const submittedForm = event.currentTarget;
+      try {
+        const user = await api("/api/admin/users", {
+          method: "POST",
+          body: JSON.stringify({
+            username: document.querySelector("#username").value.trim(),
+            displayName: document.querySelector("#displayName").value.trim(),
+            password: document.querySelector("#password").value,
+            isAdmin: document.querySelector("#isAdmin").checked
+          })
+        });
+        user.passkeyCount = 0;
+        users.push(user);
+        users.sort((a, b) => a.username.localeCompare(b.username, "de"));
+        submittedForm.reset();
+        renderUsers();
+        message("#userMessage", `${user.username} wurde angelegt.`);
+      } catch (caught) { message("#userMessage", caught.message, true); }
+    });
+
+    document.querySelector("#domainForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const submittedForm = event.currentTarget;
+      try {
+        const domain = await api("/api/admin/domains", {
+          method: "POST",
+          body: JSON.stringify({ name: document.querySelector("#domainName").value.trim() })
+        });
+        domainItems.push(domain);
+        domainItems.sort((a, b) => a.name.localeCompare(b.name, "de"));
+        submittedForm.reset();
+        renderDomains();
+      } catch (caught) { message("#domainMessage", caught.message, true); }
+    });
+
+    load().catch(caught => message("#userMessage", caught.message, true));
+  </script>
+</body>
+</html>
