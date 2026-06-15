@@ -1,0 +1,20 @@
+services:
+  servermanager:
+    build: .
+    restart: unless-stopped
+    environment:
+      APP_USERNAME: ${APP_USERNAME:?APP_USERNAME must be set}
+      APP_PASSWORD: ${APP_PASSWORD:?APP_PASSWORD must be set}
+      MAX_SESSIONS: ${MAX_SESSIONS:-10}
+      MAX_SESSION_SECONDS: ${MAX_SESSION_SECONDS:-28800}
+    ports:
+      - "127.0.0.1:8080:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /home/servermanager:size=64m,uid=10001,gid=10001,mode=700
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
