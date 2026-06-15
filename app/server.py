@@ -10,6 +10,7 @@ import secrets
 import signal
 import socket
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +24,7 @@ HOST_RE = re.compile(
     r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
 )
 USERNAME_RE = re.compile(r"^[^\r\n\x00]{1,256}$")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 RESOLUTIONS = {(1280, 720), (1366, 768), (1600, 900), (1920, 1080)}
 AUTH_COOKIE = "servermanager_session"
 LOGGER = logging.getLogger("servermanager")
@@ -89,6 +91,7 @@ class Session:
     created_at: float
     processes: list[asyncio.subprocess.Process] = field(default_factory=list)
     log_tasks: list[asyncio.Task] = field(default_factory=list)
+    log_lines: deque[str] = field(default_factory=lambda: deque(maxlen=100))
     websocket_count: int = 0
 
 
@@ -189,6 +192,17 @@ class SessionManager:
 
     async def _launch(self, session: Session, connection: dict) -> None:
         display_env = {**os.environ, "DISPLAY": f":{session.display}"}
+        for variable in (
+            "ALL_PROXY",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "all_proxy",
+            "https_proxy",
+            "http_proxy",
+            "no_proxy",
+        ):
+            display_env.pop(variable, None)
         width, height = connection["resolution"]
 
         xvfb = await asyncio.create_subprocess_exec(
@@ -204,7 +218,9 @@ class SessionManager:
             stderr=asyncio.subprocess.PIPE,
         )
         session.processes.append(xvfb)
-        session.log_tasks.append(asyncio.create_task(drain_log(xvfb.stderr, "Xvfb")))
+        session.log_tasks.append(
+            asyncio.create_task(drain_log(xvfb.stderr, "Xvfb", session.log_lines))
+        )
         await asyncio.sleep(0.35)
         ensure_running(xvfb, "Der virtuelle Bildschirm konnte nicht gestartet werden.")
 
@@ -216,7 +232,9 @@ class SessionManager:
             stderr=asyncio.subprocess.PIPE,
         )
         session.processes.append(openbox)
-        session.log_tasks.append(asyncio.create_task(drain_log(openbox.stderr, "openbox")))
+        session.log_tasks.append(
+            asyncio.create_task(drain_log(openbox.stderr, "openbox", session.log_lines))
+        )
 
         x11vnc = await asyncio.create_subprocess_exec(
             "x11vnc",
@@ -234,7 +252,9 @@ class SessionManager:
             stderr=asyncio.subprocess.PIPE,
         )
         session.processes.append(x11vnc)
-        session.log_tasks.append(asyncio.create_task(drain_log(x11vnc.stderr, "x11vnc")))
+        session.log_tasks.append(
+            asyncio.create_task(drain_log(x11vnc.stderr, "x11vnc", session.log_lines))
+        )
         await wait_for_port("127.0.0.1", session.vnc_port, timeout=5)
 
         args = [
@@ -244,11 +264,11 @@ class SessionManager:
             f"/size:{width}x{height}",
             "/bpp:24",
             "/network:auto",
-            "/compression",
-            "/auto-reconnect",
+            "+auto-reconnect",
             "/auto-reconnect-max-retries:3",
             "/from-stdin:force",
             "/log-level:WARN",
+            "/timeout:15000",
             "/f",
             "-decorations",
             "-grab-keyboard",
@@ -266,18 +286,41 @@ class SessionManager:
             *args,
             env=display_env,
             stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         session.processes.append(freerdp)
-        session.log_tasks.append(asyncio.create_task(drain_log(freerdp.stderr, "FreeRDP")))
-        freerdp.stdin.write((connection["password"] + "\n").encode("utf-8"))
-        await freerdp.stdin.drain()
-        freerdp.stdin.close()
+        session.log_tasks.append(
+            asyncio.create_task(drain_log(freerdp.stderr, "FreeRDP", session.log_lines))
+        )
+        session.log_tasks.append(
+            asyncio.create_task(drain_log(freerdp.stdout, "FreeRDP", session.log_lines))
+        )
+        try:
+            freerdp.stdin.write((connection["password"] + "\n").encode("utf-8"))
+            await freerdp.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            freerdp.stdin.close()
         connection["password"] = ""
 
-        await asyncio.sleep(0.8)
-        ensure_running(freerdp, "FreeRDP konnte die Verbindung nicht starten.")
+        try:
+            exit_code = await asyncio.wait_for(freerdp.wait(), timeout=2.5)
+        except asyncio.TimeoutError:
+            return
+
+        await asyncio.sleep(0.1)
+        details = [
+            line.removeprefix("FreeRDP: ")
+            for line in session.log_lines
+            if line.startswith("FreeRDP: ")
+        ]
+        detail = " | ".join(details[-6:])[-1200:]
+        message = f"FreeRDP wurde mit Exit-Code {exit_code} beendet."
+        if detail:
+            message += f" {detail}"
+        raise RuntimeError(message)
 
     async def _cleanup_loop(self) -> None:
         while True:
@@ -387,12 +430,17 @@ def ensure_running(process: asyncio.subprocess.Process, message: str) -> None:
         raise RuntimeError(message)
 
 
-async def drain_log(stream: asyncio.StreamReader | None, name: str) -> None:
+async def drain_log(
+    stream: asyncio.StreamReader | None,
+    name: str,
+    log_lines: deque[str],
+) -> None:
     if not stream:
         return
     while line := await stream.readline():
-        text = line.decode("utf-8", errors="replace").rstrip()
+        text = ANSI_ESCAPE_RE.sub("", line.decode("utf-8", errors="replace")).rstrip()
         if text:
+            log_lines.append(f"{name}: {text}")
             print(f"[{name}] {text}", flush=True)
 
 

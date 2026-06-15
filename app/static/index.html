@@ -135,7 +135,13 @@
     }
     .primary:hover { filter: brightness(1.05); }
     button:disabled { cursor: wait; opacity: .6; }
-    .message { min-height: 18px; margin: -4px 0 7px; color: var(--danger); font-size: .75rem; }
+    .message {
+      min-height: 18px;
+      margin: -4px 0 7px;
+      color: var(--danger);
+      font-size: .75rem;
+      overflow-wrap: anywhere;
+    }
     .viewer { display: none; height: 100vh; background: #03070c; overflow: hidden; }
     .viewer.active { display: grid; grid-template-rows: 44px minmax(0, 1fr); }
     .toolbar {
