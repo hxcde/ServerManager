@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import contextlib
 import hmac
 import ipaddress
@@ -24,11 +23,65 @@ HOST_RE = re.compile(
 )
 USERNAME_RE = re.compile(r"^[^\r\n\x00]{1,256}$")
 RESOLUTIONS = {(1280, 720), (1366, 768), (1600, 900), (1920, 1080)}
+AUTH_COOKIE = "servermanager_session"
+
+
+@dataclass
+class AuthSession:
+    session_id: str
+    csrf_token: str
+    expires_at: float
+
+
+class AuthManager:
+    def __init__(self) -> None:
+        self.sessions: dict[str, AuthSession] = {}
+        self.failed_logins: dict[str, list[float]] = {}
+        self.session_seconds = int(os.getenv("AUTH_SESSION_SECONDS", "28800"))
+        self.login_window_seconds = 300
+        self.max_login_attempts = 5
+
+    def create(self) -> AuthSession:
+        session = AuthSession(
+            session_id=secrets.token_urlsafe(32),
+            csrf_token=secrets.token_urlsafe(32),
+            expires_at=time.time() + self.session_seconds,
+        )
+        self.sessions[session.session_id] = session
+        return session
+
+    def get(self, session_id: str | None) -> AuthSession | None:
+        if not session_id:
+            return None
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        if session.expires_at <= time.time():
+            self.sessions.pop(session_id, None)
+            return None
+        return session
+
+    def delete(self, session_id: str | None) -> None:
+        if session_id:
+            self.sessions.pop(session_id, None)
+
+    def login_allowed(self, client_ip: str) -> bool:
+        cutoff = time.time() - self.login_window_seconds
+        attempts = [stamp for stamp in self.failed_logins.get(client_ip, []) if stamp > cutoff]
+        self.failed_logins[client_ip] = attempts
+        return len(attempts) < self.max_login_attempts
+
+    def record_failure(self, client_ip: str) -> None:
+        self.failed_logins.setdefault(client_ip, []).append(time.time())
+
+    def clear_failures(self, client_ip: str) -> None:
+        self.failed_logins.pop(client_ip, None)
 
 
 @dataclass
 class Session:
     session_id: str
+    owner_id: str
     display: int
     vnc_port: int
     created_at: float
@@ -61,7 +114,7 @@ class SessionManager:
             return_exceptions=True,
         )
 
-    async def create(self, payload: dict) -> Session:
+    async def create(self, payload: dict, owner_id: str) -> Session:
         connection = validate_connection(payload)
 
         async with self.lock:
@@ -86,6 +139,7 @@ class SessionManager:
             vnc_port = find_free_port(self.port_min, self.port_min + self.max_sessions + 20)
             session = Session(
                 session_id=secrets.token_urlsafe(24),
+                owner_id=owner_id,
                 display=display,
                 vnc_port=vnc_port,
                 created_at=time.monotonic(),
@@ -122,6 +176,14 @@ class SessionManager:
         for task in session.log_tasks:
             task.cancel()
         await asyncio.gather(*session.log_tasks, return_exceptions=True)
+
+    async def stop_owned(self, owner_id: str) -> None:
+        owned = [
+            session_id
+            for session_id, session in self.sessions.items()
+            if session.owner_id == owner_id
+        ]
+        await asyncio.gather(*(self.stop(session_id) for session_id in owned))
 
     async def _launch(self, session: Session, connection: dict) -> None:
         display_env = {**os.environ, "DISPLAY": f":{session.display}"}
@@ -332,47 +394,104 @@ async def drain_log(stream: asyncio.StreamReader | None, name: str) -> None:
             print(f"[{name}] {text}", flush=True)
 
 
-def check_basic_auth(request: web.Request) -> bool:
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Basic "):
-        return False
-    try:
-        decoded = base64.b64decode(auth_header[6:], validate=True).decode("utf-8")
-        username, password = decoded.split(":", 1)
-    except (ValueError, UnicodeDecodeError):
-        return False
-    expected_user = os.environ["APP_USERNAME"]
-    expected_password = os.environ["APP_PASSWORD"]
-    return hmac.compare_digest(username, expected_user) and hmac.compare_digest(
-        password, expected_password
-    )
+def request_origin(request: web.Request) -> str:
+    forwarded_proto = request.headers.get("X-Forwarded-Proto")
+    scheme = forwarded_proto or request.scheme
+    return f"{scheme}://{request.host}"
+
+
+def secure_cookie(request: web.Request) -> bool:
+    return request.headers.get("X-Forwarded-Proto", request.scheme) == "https"
 
 
 @web.middleware
 async def security_middleware(request: web.Request, handler):
-    if request.path == "/healthz":
+    if request.path in {"/healthz", "/login"}:
+        if request.method == "POST":
+            origin = request.headers.get("Origin")
+            if origin and origin != request_origin(request):
+                raise web.HTTPForbidden(text="Ungültiger Anfrageursprung.")
         return await handler(request)
-    if not check_basic_auth(request):
+
+    auth = request.app["auth"].get(request.cookies.get(AUTH_COOKIE))
+    if not auth:
+        if request.method == "GET" and not request.path.startswith("/api/"):
+            raise web.HTTPFound("/login")
         raise web.HTTPUnauthorized(
-            headers={"WWW-Authenticate": 'Basic realm="ServerManager", charset="UTF-8"'}
+            text=json.dumps({"error": "Die Anmeldung ist abgelaufen."}),
+            content_type="application/json",
         )
+    request["auth"] = auth
+
     is_websocket = request.path.endswith("/websocket")
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} or is_websocket:
         origin = request.headers.get("Origin")
-        expected = f"{request.scheme}://{request.host}"
-        forwarded_proto = request.headers.get("X-Forwarded-Proto")
-        if forwarded_proto:
-            expected = f"{forwarded_proto}://{request.host}"
-        if not origin or origin != expected:
+        if not origin or origin != request_origin(request):
             raise web.HTTPForbidden(
                 text=json.dumps({"error": "Ungültiger Anfrageursprung."}),
+                content_type="application/json",
+            )
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        csrf_token = request.headers.get("X-CSRF-Token", "")
+        if not hmac.compare_digest(csrf_token, auth.csrf_token):
+            raise web.HTTPForbidden(
+                text=json.dumps({"error": "Ungültiges Sicherheitstoken."}),
                 content_type="application/json",
             )
     return await handler(request)
 
 
-async def index(request: web.Request) -> web.FileResponse:
-    return web.FileResponse(STATIC_DIR / "index.html")
+async def login_page(request: web.Request) -> web.StreamResponse:
+    if request.method == "GET":
+        if request.app["auth"].get(request.cookies.get(AUTH_COOKIE)):
+            raise web.HTTPFound("/")
+        return web.FileResponse(STATIC_DIR / "login.html")
+
+    client_ip = request.headers.get("X-Forwarded-For", request.remote or "unknown").split(",")[0].strip()
+    if not request.app["auth"].login_allowed(client_ip):
+        raise web.HTTPFound("/login?locked=1")
+
+    form = await request.post()
+    username = str(form.get("username", ""))
+    password = str(form.get("password", ""))
+    valid = hmac.compare_digest(username, os.environ["APP_USERNAME"]) and hmac.compare_digest(
+        password, os.environ["APP_PASSWORD"]
+    )
+    if not valid:
+        request.app["auth"].record_failure(client_ip)
+        raise web.HTTPFound("/login?error=1")
+
+    request.app["auth"].clear_failures(client_ip)
+    auth = request.app["auth"].create()
+    response = web.HTTPFound("/")
+    response.set_cookie(
+        AUTH_COOKIE,
+        auth.session_id,
+        max_age=request.app["auth"].session_seconds,
+        httponly=True,
+        secure=secure_cookie(request),
+        samesite="Strict",
+        path="/",
+    )
+    raise response
+
+
+async def logout(request: web.Request) -> web.Response:
+    await request.app["sessions"].stop_owned(request["auth"].session_id)
+    request.app["auth"].delete(request.cookies.get(AUTH_COOKIE))
+    response = web.json_response({"ok": True})
+    response.del_cookie(AUTH_COOKIE, path="/")
+    return response
+
+
+async def index(request: web.Request) -> web.Response:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = html.replace("__CSRF_TOKEN__", request["auth"].csrf_token)
+    return web.Response(
+        text=html,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def create_session(request: web.Request) -> web.Response:
@@ -383,7 +502,7 @@ async def create_session(request: web.Request) -> web.Response:
             text=json.dumps({"error": "Ungültige Anfrage."}),
             content_type="application/json",
         )
-    session = await request.app["sessions"].create(payload)
+    session = await request.app["sessions"].create(payload, request["auth"].session_id)
     return web.json_response(
         {
             "id": session.session_id,
@@ -394,14 +513,18 @@ async def create_session(request: web.Request) -> web.Response:
 
 
 async def delete_session(request: web.Request) -> web.Response:
-    await request.app["sessions"].stop(request.match_info["session_id"])
+    session_id = request.match_info["session_id"]
+    session = request.app["sessions"].sessions.get(session_id)
+    if session and session.owner_id != request["auth"].session_id:
+        raise web.HTTPNotFound()
+    await request.app["sessions"].stop(session_id)
     return web.Response(status=204)
 
 
 async def websocket_proxy(request: web.Request) -> web.WebSocketResponse:
     session_id = request.match_info["session_id"]
     session = request.app["sessions"].sessions.get(session_id)
-    if not session:
+    if not session or session.owner_id != request["auth"].session_id:
         raise web.HTTPNotFound()
 
     ws = web.WebSocketResponse(protocols=("binary",))
@@ -463,7 +586,10 @@ def create_app() -> web.Application:
         client_max_size=16 * 1024,
     )
     app["sessions"] = SessionManager()
+    app["auth"] = AuthManager()
     app.router.add_get("/", index)
+    app.router.add_route("*", "/login", login_page)
+    app.router.add_post("/logout", logout)
     app.router.add_post("/api/sessions", create_session)
     app.router.add_delete("/api/sessions/{session_id}", delete_session)
     app.router.add_get("/api/sessions/{session_id}/websocket", websocket_proxy)

@@ -1,6 +1,8 @@
 # ServerManager
 
-ServerManager ist ein eigenständiger Browser-RDP-Gateway-MVP für einen Linux-Server. Er startet pro Verbindung eine isolierte FreeRDP-Sitzung in einem virtuellen X11-Bildschirm und überträgt diesen über x11vnc, WebSocket und noVNC in den Browser.
+ServerManager ist ein eigenständiger Browser-RDP-Gateway-MVP. Er startet pro
+Verbindung eine isolierte FreeRDP-Sitzung in einem virtuellen X11-Bildschirm und
+überträgt diesen über x11vnc, WebSocket und noVNC in den Browser.
 
 ## Funktionen
 
@@ -10,10 +12,11 @@ ServerManager ist ein eigenständiger Browser-RDP-Gateway-MVP für einen Linux-S
 - Zwischenablage und mehrere Bildschirmauflösungen
 - Parallele, voneinander getrennte Sitzungsprozesse
 - Automatische Zeitbegrenzung und Prozessbereinigung
-- HTTP Basic Auth vor Anwendung und WebSocket
+- Eigene Anmeldemaske mit zeitlich begrenzter, serverseitiger Sitzung
+- HttpOnly-Cookie, SameSite-Schutz und CSRF-Token
 - Keine persistente Speicherung von RDP-Passwörtern
 
-## Installation auf dem Linux-Server
+## Start
 
 ```bash
 git clone https://github.com/hxcde/ServerManager.git
@@ -34,7 +37,12 @@ Danach ist die Oberfläche im lokalen Netzwerk unter folgender Adresse erreichba
 http://IP-DES-LINUX-SERVERS:8080
 ```
 
-Der Browser fragt nach `APP_USERNAME` und `APP_PASSWORD` aus der `.env`-Datei. `BIND_ADDRESS=0.0.0.0` erlaubt den Zugriff aus dem LAN. Sobald Nginx mit HTTPS eingerichtet ist, sollte `BIND_ADDRESS` wieder auf `127.0.0.1` gesetzt werden. Eine Nginx-Vorlage liegt unter `nginx/servermanager.conf`.
+Die Anwendung zeigt eine eigene Anmeldemaske. Dafür gelten `APP_USERNAME` und
+`APP_PASSWORD` aus der `.env`-Datei. Die Anmeldung wird standardmäßig acht
+Stunden gehalten und kann mit `AUTH_SESSION_SECONDS` angepasst werden.
+`BIND_ADDRESS=0.0.0.0` erlaubt den Zugriff aus dem LAN. Sobald Nginx mit HTTPS
+eingerichtet ist, sollte `BIND_ADDRESS` wieder auf `127.0.0.1` gesetzt werden.
+Eine Nginx-Vorlage liegt unter `nginx/servermanager.conf`.
 
 ## Kein Zugriff vom PC
 
@@ -71,7 +79,8 @@ Die Server-IP lässt sich beispielsweise mit `hostname -I` anzeigen.
 
 ## Sicherheit
 
-Die Anwendung ist ein administrativer MVP und sollte nur in einem geschützten Management-Netz betrieben werden.
+Die Anwendung ist ein administrativer MVP und sollte nur in einem geschützten
+Management-Netz betrieben werden.
 
 - Port 8080 ohne HTTPS nur vorübergehend in einem vertrauenswürdigen LAN verwenden.
 - Zugriff zusätzlich über VPN, Zero-Trust-Proxy oder IP-Allowlist begrenzen.
@@ -80,7 +89,9 @@ Die Anwendung ist ein administrativer MVP und sollte nur in einem geschützten M
 - Container nicht mit Host-Netzwerk oder privilegiert starten.
 - RDP-Ziele per Firewall auf den Gateway-Server beschränken.
 
-Das RDP-Passwort wird im Request empfangen, direkt über `stdin` an FreeRDP übergeben, danach aus dem Session-Payload entfernt und weder protokolliert noch auf einem Datenträger gespeichert.
+Das RDP-Passwort wird im Request empfangen, direkt über `stdin` an FreeRDP
+übergeben, danach aus dem Session-Payload entfernt und weder protokolliert noch
+auf einem Datenträger gespeichert.
 
 ## Architektur
 
